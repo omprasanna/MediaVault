@@ -5,7 +5,12 @@ const mongoose = require('mongoose');
 const path = require('path');
 const Batch = require('../models/Batch');
 const Job = require('../models/Job');
-const { enqueueMediaJob, getJobProgressCache } = require('../queues/mediaQueue');
+const mediaQueue = require('../queues/mediaQueue');
+const {
+  clearJobProgressCache,
+  getJobProgressCache,
+  removeQueuedMediaJob,
+} = mediaQueue;
 const { AppError } = require('../utils/errors');
 const { sanitizeFilename } = require('../utils/formatMapper');
 const { assertPublicUrl } = require('../utils/ssrf');
@@ -20,13 +25,18 @@ const VALID_STATUSES = new Set([
   'queued',
   'downloading',
   'muxing',
+  'paused',
   'ready',
   'failed',
   'expired',
   'cancelled',
 ]);
 const ACTIVE_STATUSES = new Set(['queued', 'downloading', 'muxing']);
-const MAX_BATCH_ITEMS = 50;
+
+function getMaxBatchItems() {
+  const parsed = Number(process.env.MAX_BATCH_ITEMS || 0);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+}
 
 function getDownloadsDir() {
   return path.resolve(process.env.DOWNLOADS_DIR || '/data/downloads');
@@ -77,24 +87,31 @@ router.post('/', async (req, res, next) => {
       throw new AppError(400, 'INVALID_REQUEST', 'At least one download item is required.');
     }
 
-    if (rawItems.length > MAX_BATCH_ITEMS) {
+    const maxBatchItems = getMaxBatchItems();
+    if (maxBatchItems > 0 && rawItems.length > maxBatchItems) {
       throw new AppError(
         400,
         'INVALID_REQUEST',
-        `A single batch cannot exceed ${MAX_BATCH_ITEMS} items.`
+        `A single batch cannot exceed ${maxBatchItems} items.`
       );
     }
 
     await assertSufficientDiskSpace(getDownloadsDir());
 
     const userId = getRequestUserId(req);
+    const verifiedHosts = new Set();
+    const verifiedCookiePlatforms = new Set();
+
     const playlistUrl =
       typeof body.playlistUrl === 'string' && body.playlistUrl.trim()
         ? body.playlistUrl.trim()
         : null;
     if (playlistUrl) {
       const validatedPlaylist = validateMediaUrl(playlistUrl);
-      await assertPublicUrl(validatedPlaylist.url);
+      if (!verifiedHosts.has(validatedPlaylist.hostname)) {
+        await assertPublicUrl(validatedPlaylist.url);
+        verifiedHosts.add(validatedPlaylist.hostname);
+      }
     }
 
     const fallbackUrl =
@@ -140,7 +157,10 @@ router.post('/', async (req, res, next) => {
             : fallbackUrl;
 
       const validated = validateMediaUrl(itemUrl);
-      await assertPublicUrl(validated.url);
+      if (!verifiedHosts.has(validated.hostname)) {
+        await assertPublicUrl(validated.url);
+        verifiedHosts.add(validated.hostname);
+      }
 
       const resolvedModeHint =
         typeof rawItem.mode === 'string' ? rawItem.mode : sharedMode;
@@ -181,8 +201,9 @@ router.post('/', async (req, res, next) => {
       const useCookies =
         rawItem.useCookies !== undefined ? rawItem.useCookies === true : defaultUseCookies;
 
-      if (useCookies) {
+      if (useCookies && !verifiedCookiePlatforms.has(validated.platform)) {
         await resolveCookieFile(validated.platform);
+        verifiedCookiePlatforms.add(validated.platform);
       }
 
       const formatSelector = enforce1080pSelector(
@@ -240,19 +261,21 @@ router.post('/', async (req, res, next) => {
       }))
     );
 
-    const jobIds = [];
-    for (const jobDoc of createdJobs) {
-      try {
-        await enqueueMediaJob(jobDoc);
-        jobIds.push(jobDoc._id.toString());
-      } catch (queueErr) {
-        await Job.findByIdAndUpdate(jobDoc._id, {
+    try {
+      await mediaQueue.enqueueMediaJobsBulk(createdJobs);
+    } catch (queueErr) {
+      const createdIds = createdJobs.map((doc) => doc._id);
+      await Job.updateMany(
+        { _id: { $in: createdIds } },
+        {
           status: 'failed',
           errorMessage: `Failed to enqueue job: ${queueErr.message}`,
-        });
-        throw queueErr;
-      }
+        }
+      );
+      throw queueErr;
     }
+
+    const jobIds = createdJobs.map((doc) => doc._id.toString());
 
     return res.status(202).json({
       success: true,
@@ -266,34 +289,97 @@ router.post('/', async (req, res, next) => {
 
 /**
  * GET /api/jobs
- * Lists paginated download job history for the current user.
+ * Lists paginated download job history for the current user with user-wide counts.
  */
 router.get('/', async (req, res, next) => {
   try {
     const userId = getRequestUserId(req);
-    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit || '20'), 10) || 20));
+    const userObjectId = mongoose.Types.ObjectId.isValid(userId)
+      ? new mongoose.Types.ObjectId(userId)
+      : userId;
 
-    const filter = { userId };
+    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || '20'), 10) || 20));
+    const prioritizeActive =
+      String(req.query.prioritizeActive || '').toLowerCase() === 'true';
+
+    const filter = { userId: userObjectId };
     if (typeof req.query.status === 'string' && req.query.status.trim()) {
       const requestedStatus = req.query.status.trim().toLowerCase();
-      if (!VALID_STATUSES.has(requestedStatus)) {
-        throw new AppError(400, 'INVALID_REQUEST', `Invalid status filter "${requestedStatus}".`);
+      if (requestedStatus === 'active') {
+        filter.status = { $in: ['queued', 'downloading', 'muxing'] };
+      } else if (requestedStatus === 'primary') {
+        filter.status = { $nin: ['expired', 'cancelled'] };
+      } else if (requestedStatus === 'history') {
+        filter.status = { $in: ['expired', 'cancelled'] };
+      } else if (requestedStatus !== 'all') {
+        if (!VALID_STATUSES.has(requestedStatus)) {
+          throw new AppError(
+            400,
+            'INVALID_REQUEST',
+            `Invalid status filter "${requestedStatus}".`
+          );
+        }
+        filter.status = requestedStatus;
       }
-      filter.status = requestedStatus;
     }
+
     if (typeof req.query.batchId === 'string' && req.query.batchId.trim()) {
       filter.batchId = req.query.batchId.trim();
     }
 
-    const [total, jobs] = await Promise.all([
+    const jobsQueryPromise = prioritizeActive
+      ? Job.aggregate([
+          { $match: filter },
+          {
+            $addFields: {
+              _statusRank: {
+                $switch: {
+                  branches: [
+                    { case: { $eq: ['$status', 'downloading'] }, then: 0 },
+                    { case: { $eq: ['$status', 'muxing'] }, then: 1 },
+                    { case: { $eq: ['$status', 'queued'] }, then: 2 },
+                    { case: { $eq: ['$status', 'paused'] }, then: 3 },
+                    { case: { $eq: ['$status', 'ready'] }, then: 4 },
+                    { case: { $eq: ['$status', 'failed'] }, then: 5 },
+                    { case: { $eq: ['$status', 'expired'] }, then: 6 },
+                    { case: { $eq: ['$status', 'cancelled'] }, then: 7 },
+                  ],
+                  default: 8,
+                },
+              },
+            },
+          },
+          { $sort: { _statusRank: 1, createdAt: -1, _id: 1 } },
+          { $skip: (page - 1) * limit },
+          { $limit: limit },
+        ])
+      : Job.find(filter)
+          .sort({ createdAt: -1 })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .lean();
+
+    const [total, jobs, statusBuckets] = await Promise.all([
       Job.countDocuments(filter),
-      Job.find(filter)
-        .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .lean(),
+      jobsQueryPromise,
+      Job.aggregate([
+        { $match: { userId: userObjectId } },
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+      ]),
     ]);
+
+    const byStatus = Object.create(null);
+    for (const bucket of statusBuckets) {
+      byStatus[bucket._id] = bucket.count;
+    }
+
+    const activeCount =
+      (byStatus.queued || 0) + (byStatus.downloading || 0) + (byStatus.muxing || 0);
+    const pausedCount = byStatus.paused || 0;
+    const readyCount = byStatus.ready || 0;
+    const failedCount = byStatus.failed || 0;
+    const historyCount = (byStatus.expired || 0) + (byStatus.cancelled || 0);
 
     const enrichedJobs = await Promise.all(
       jobs.map(async (job) => {
@@ -321,13 +407,258 @@ router.get('/', async (req, res, next) => {
       })
     );
 
+    const pages = Math.max(1, Math.ceil(total / limit));
+
     return res.status(200).json({
       jobs: enrichedJobs,
+      counts: {
+        all: activeCount + pausedCount + readyCount + failedCount,
+        active: activeCount,
+        paused: pausedCount,
+        ready: readyCount,
+        failed: failedCount,
+        history: historyCount,
+      },
       pagination: {
         total,
         page,
-        pages: Math.max(1, Math.ceil(total / limit)),
+        limit,
+        pages,
+        hasMore: page < pages,
       },
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * POST /api/jobs/pause-all
+ * Pauses all queued, downloading, or muxing jobs belonging to the authenticated user.
+ */
+router.post('/pause-all', async (req, res, next) => {
+  try {
+    const userId = getRequestUserId(req);
+    const activeJobs = await Job.find({
+      userId,
+      status: { $in: ['queued', 'downloading', 'muxing'] },
+    })
+      .select('_id status')
+      .lean();
+
+    if (activeJobs.length === 0) {
+      return res.status(200).json({ success: true, pausedCount: 0 });
+    }
+
+    const queuedIds = [];
+    const runningIds = [];
+    const allIds = [];
+
+    for (const item of activeJobs) {
+      const idStr = item._id.toString();
+      allIds.push(idStr);
+      if (item.status === 'queued') {
+        queuedIds.push(idStr);
+      } else {
+        runningIds.push(idStr);
+      }
+    }
+
+    if (queuedIds.length > 0) {
+      await Promise.all(queuedIds.map((id) => mediaQueue.removeQueuedMediaJob(id)));
+    }
+
+    await Job.updateMany(
+      { _id: { $in: activeJobs.map((j) => j._id) }, userId },
+      {
+        status: 'paused',
+        downloadSpeed: null,
+        eta: null,
+        errorMessage: null,
+      }
+    );
+
+    await Promise.all(
+      allIds.map((id) => mediaQueue.clearJobProgressCache(id).catch(() => {}))
+    );
+
+    if (runningIds.length > 0) {
+      await mediaQueue.publishJobControl({ action: 'pause-many', jobIds: runningIds });
+    }
+
+    return res.status(200).json({
+      success: true,
+      pausedCount: activeJobs.length,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * POST /api/jobs/resume-all
+ * Requeues all paused jobs belonging to the authenticated user while retaining partial downloads.
+ */
+router.post('/resume-all', async (req, res, next) => {
+  try {
+    const userId = getRequestUserId(req);
+    await assertSufficientDiskSpace(getDownloadsDir());
+
+    const pausedJobs = await Job.find({ userId, status: 'paused' })
+      .sort({ createdAt: 1, _id: 1 })
+      .lean();
+
+    if (pausedJobs.length === 0) {
+      return res.status(200).json({ success: true, resumedCount: 0 });
+    }
+
+    await Job.updateMany(
+      { _id: { $in: pausedJobs.map((j) => j._id) }, userId },
+      {
+        status: 'queued',
+        downloadSpeed: null,
+        eta: null,
+        errorMessage: null,
+      }
+    );
+
+    await mediaQueue.requeueMediaJobsBulk(pausedJobs);
+
+    return res.status(200).json({
+      success: true,
+      resumedCount: pausedJobs.length,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * DELETE /api/jobs
+ * Clears all jobs (and associated batch records) belonging to the authenticated user,
+ * cancelling any queued/running downloads and optionally deleting finished files from disk.
+ */
+router.delete('/', async (req, res, next) => {
+  try {
+    const userId = getRequestUserId(req);
+    const deleteFiles =
+      String(req.query?.deleteFiles || '').toLowerCase() === 'true' ||
+      req.body?.deleteFiles === true;
+
+    const userJobs = await Job.find({ userId })
+      .select('_id status filePath batchId')
+      .lean();
+
+    if (userJobs.length === 0) {
+      return res.status(200).json({
+        success: true,
+        deletedCount: 0,
+        cancelledActiveCount: 0,
+        deletedFilesCount: 0,
+      });
+    }
+
+    const allObjectIds = [];
+    const allIdStrings = [];
+    const allIdSet = new Set();
+    const activeIds = [];
+    const batchIdSet = new Set();
+
+    for (const job of userJobs) {
+      const idStr = job._id.toString();
+      allObjectIds.push(job._id);
+      allIdStrings.push(idStr);
+      allIdSet.add(idStr);
+      if (ACTIVE_STATUSES.has(job.status)) {
+        activeIds.push(idStr);
+      }
+      if (typeof job.batchId === 'string' && job.batchId.trim()) {
+        batchIdSet.add(job.batchId.trim());
+      }
+    }
+
+    await mediaQueue.removeQueuedMediaJobsBulk(allIdStrings);
+
+    const deleteResult = await Job.deleteMany({
+      _id: { $in: allObjectIds },
+      userId,
+    });
+
+    if (activeIds.length > 0) {
+      await mediaQueue.publishJobControl({
+        action: 'cancel-many',
+        jobIds: activeIds,
+      });
+    }
+
+    await mediaQueue.clearJobProgressCachesBulk(allIdStrings).catch(() => {});
+
+    const batchIds = Array.from(batchIdSet);
+    if (batchIds.length > 0) {
+      await Batch.deleteMany({ userId, batchId: { $in: batchIds } });
+    }
+
+    const downloadsDir = getDownloadsDir();
+    try {
+      const tmpDir = path.join(downloadsDir, '.mediavault-tmp');
+      const tmpEntries = await fs.promises.readdir(tmpDir);
+      await Promise.all(
+        tmpEntries.map((entry) => {
+          const dotIdx = entry.indexOf('.');
+          if (dotIdx > 0 && allIdSet.has(entry.slice(0, dotIdx))) {
+            return fs.promises.unlink(path.join(tmpDir, entry)).catch(() => {});
+          }
+          return Promise.resolve();
+        })
+      );
+    } catch {
+      // Ignore missing temp directory
+    }
+
+    let deletedFilesCount = 0;
+    if (deleteFiles) {
+      const candidateDirs = new Set();
+      for (const job of userJobs) {
+        if (!job.filePath || typeof job.filePath !== 'string') {
+          continue;
+        }
+        const resolvedPath = path.resolve(job.filePath);
+        if (!resolvedPath.startsWith(`${downloadsDir}${path.sep}`)) {
+          continue;
+        }
+        try {
+          await fs.promises.unlink(resolvedPath);
+          deletedFilesCount += 1;
+        } catch (err) {
+          if (err && err.code !== 'ENOENT') {
+            console.error(`Failed to delete file ${resolvedPath}:`, err.message);
+          }
+        }
+
+        const parentDir = path.dirname(resolvedPath);
+        if (
+          parentDir !== downloadsDir &&
+          parentDir.startsWith(`${downloadsDir}${path.sep}`) &&
+          path.basename(parentDir) !== '.mediavault-tmp'
+        ) {
+          candidateDirs.add(parentDir);
+        }
+      }
+
+      if (candidateDirs.size > 0) {
+        await Promise.all(
+          Array.from(candidateDirs).map((dir) =>
+            fs.promises.rmdir(dir).catch(() => {})
+          )
+        );
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      deletedCount: deleteResult?.deletedCount ?? userJobs.length,
+      cancelledActiveCount: activeIds.length,
+      deletedFilesCount,
     });
   } catch (err) {
     return next(err);
@@ -345,6 +676,264 @@ router.delete('/expired', async (req, res, next) => {
     return res.status(200).json({
       success: true,
       deletedCount: result?.deletedCount || 0,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * POST /api/jobs/:id/pause
+ * Pauses a queued or active download job while retaining partial files on disk.
+ */
+router.post('/:id/pause', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      throw new AppError(404, 'JOB_NOT_FOUND', 'Requested job ID does not exist.');
+    }
+
+    const userId = getRequestUserId(req);
+    const job = await Job.findOne({ _id: id, userId });
+    if (!job) {
+      throw new AppError(404, 'JOB_NOT_FOUND', 'Requested job ID does not exist.');
+    }
+
+    if (job.status === 'paused') {
+      return res.status(200).json({ success: true, id, status: 'paused' });
+    }
+
+    if (!['queued', 'downloading', 'muxing'].includes(job.status)) {
+      throw new AppError(
+        409,
+        'INVALID_JOB_STATE',
+        `Cannot pause a job in "${job.status}" state.`
+      );
+    }
+
+    const previousStatus = job.status;
+    if (previousStatus === 'queued') {
+      await mediaQueue.removeQueuedMediaJob(id);
+    }
+
+    await Job.updateOne(
+      { _id: job._id, userId },
+      {
+        status: 'paused',
+        downloadSpeed: null,
+        eta: null,
+        errorMessage: null,
+      }
+    );
+    await mediaQueue.clearJobProgressCache(id).catch(() => {});
+
+    if (previousStatus === 'downloading' || previousStatus === 'muxing') {
+      await mediaQueue.publishJobControl({ action: 'pause', jobId: id });
+    }
+
+    return res.status(200).json({
+      success: true,
+      id,
+      status: 'paused',
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * POST /api/jobs/:id/resume
+ * Resumes a paused job from its preserved partial download via `yt-dlp --continue`.
+ */
+router.post('/:id/resume', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      throw new AppError(404, 'JOB_NOT_FOUND', 'Requested job ID does not exist.');
+    }
+
+    const userId = getRequestUserId(req);
+    const job = await Job.findOne({ _id: id, userId });
+    if (!job) {
+      throw new AppError(404, 'JOB_NOT_FOUND', 'Requested job ID does not exist.');
+    }
+
+    if (job.status !== 'paused') {
+      throw new AppError(
+        409,
+        'INVALID_JOB_STATE',
+        `Only paused jobs can be resumed (current status: "${job.status}").`
+      );
+    }
+
+    await assertSufficientDiskSpace(getDownloadsDir());
+    if (job.useCookies) {
+      await resolveCookieFile(job.platform);
+    }
+
+    await Job.updateOne(
+      { _id: job._id, userId },
+      {
+        status: 'queued',
+        downloadSpeed: null,
+        eta: null,
+        errorMessage: null,
+      }
+    );
+
+    await mediaQueue.requeueMediaJob(job);
+
+    return res.status(202).json({
+      success: true,
+      id,
+      status: 'queued',
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * POST /api/jobs/:id/retry
+ * Retries a failed, paused, or stalled active download in-place while retaining `.part` files.
+ */
+router.post('/:id/retry', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      throw new AppError(404, 'JOB_NOT_FOUND', 'Requested job ID does not exist.');
+    }
+
+    const userId = getRequestUserId(req);
+    const job = await Job.findOne({ _id: id, userId });
+    if (!job) {
+      throw new AppError(404, 'JOB_NOT_FOUND', 'Requested job ID does not exist.');
+    }
+
+    if (!['failed', 'paused', 'downloading', 'muxing', 'queued'].includes(job.status)) {
+      throw new AppError(
+        409,
+        'INVALID_JOB_STATE',
+        `Cannot retry a job in "${job.status}" state.`
+      );
+    }
+
+    const nextUseCookies =
+      req.body && req.body.useCookies === true ? true : Boolean(job.useCookies);
+
+    await assertSufficientDiskSpace(getDownloadsDir());
+    if (nextUseCookies) {
+      await resolveCookieFile(job.platform);
+    }
+
+    const previousStatus = job.status;
+    let delayMs = 0;
+
+    if (previousStatus === 'downloading' || previousStatus === 'muxing') {
+      await mediaQueue.publishJobControl({ action: 'cancel-for-retry', jobId: id });
+      delayMs = 600;
+    } else if (previousStatus === 'queued') {
+      await mediaQueue.removeQueuedMediaJob(id);
+    }
+
+    await Job.updateOne(
+      { _id: job._id, userId },
+      {
+        status: 'queued',
+        useCookies: nextUseCookies,
+        downloadSpeed: null,
+        eta: null,
+        errorMessage: null,
+      }
+    );
+    await mediaQueue.clearJobProgressCache(id).catch(() => {});
+
+    await mediaQueue.requeueMediaJob(job, { delayMs });
+
+    return res.status(202).json({
+      success: true,
+      id,
+      status: 'queued',
+      useCookies: nextUseCookies,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * DELETE /api/jobs/:id
+ * Cancels/removes a queued, ready, failed, or expired job and deletes its saved media file from disk.
+ */
+router.delete('/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      throw new AppError(404, 'JOB_NOT_FOUND', 'Requested job ID does not exist.');
+    }
+
+    const userId = getRequestUserId(req);
+    const job = await Job.findOne({ _id: id, userId });
+    if (!job) {
+      throw new AppError(404, 'JOB_NOT_FOUND', 'Requested job ID does not exist.');
+    }
+
+    if (job.status === 'downloading' || job.status === 'muxing') {
+      throw new AppError(
+        409,
+        'JOB_ACTIVE',
+        'Cannot delete a job while it is actively downloading or muxing.'
+      );
+    }
+
+    if (job.status === 'queued') {
+      await mediaQueue.removeQueuedMediaJob(id);
+    }
+
+    const downloadsDir = getDownloadsDir();
+    try {
+      const tmpDir = path.join(downloadsDir, '.mediavault-tmp');
+      const tmpEntries = await fs.promises.readdir(tmpDir);
+      await Promise.all(
+        tmpEntries
+          .filter((entry) => entry.startsWith(`${id}.`))
+          .map((entry) => fs.promises.unlink(path.join(tmpDir, entry)).catch(() => {}))
+      );
+    } catch {
+      // Ignore missing temp directory
+    }
+
+    let fileDeleted = false;
+    if (job.filePath && typeof job.filePath === 'string') {
+      const resolvedPath = path.resolve(job.filePath);
+      if (resolvedPath.startsWith(`${downloadsDir}${path.sep}`)) {
+        try {
+          await fs.promises.unlink(resolvedPath);
+          fileDeleted = true;
+        } catch (err) {
+          if (err && err.code !== 'ENOENT') {
+            throw err;
+          }
+        }
+
+        const parentDir = path.dirname(resolvedPath);
+        if (
+          parentDir !== downloadsDir &&
+          parentDir.startsWith(`${downloadsDir}${path.sep}`) &&
+          path.basename(parentDir) !== '.mediavault-tmp'
+        ) {
+          await fs.promises.rmdir(parentDir).catch(() => {});
+        }
+      }
+    }
+
+    await Job.deleteOne({ _id: job._id });
+    await clearJobProgressCache(id).catch(() => {});
+
+    return res.status(200).json({
+      success: true,
+      deletedId: id,
+      fileDeleted,
     });
   } catch (err) {
     return next(err);

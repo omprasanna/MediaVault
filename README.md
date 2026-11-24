@@ -13,7 +13,7 @@ MediaVault runs inside a dedicated Docker network (`mediavault-net`) composed of
 | `mongo` | MongoDB 7 persistence (`users`, `jobs`, `batches`, `cookies` metadata) |
 | `redis` | Redis 7 backing BullMQ job queues and transient download telemetry |
 | `api` | Node.js + Express REST API, JWT auth, fast-path `/api/proxy`, and `/api/system` |
-| `worker` | BullMQ worker (`concurrency: 2`, `--js-runtimes node`, 1080p stream-copy muxing & MP3 extraction, 30m auto-purge) |
+| `worker` | BullMQ worker (`concurrency: 2`, `--js-runtimes node`, 1080p stream-copy muxing & MP3 extraction, clean-filename persistent host Downloads storage) |
 | `client` | Next.js App Router UI (`dev` HMR target by default; Next.js `standalone` `prod` target via `docker-compose.prod.yml`) |
 | `cloudflared` | Optional Cloudflare Tunnel (`profiles: ["tunnel"]`) for encrypted phone/remote access |
 
@@ -106,3 +106,12 @@ Whenever upstream platform extractor changes break inspection or downloads, rebu
 # Production override stack
 .\scripts\update-ytdlp.ps1 -Prod
 ```
+
+---
+
+## Full Playlists & Persistent Downloads Storage
+
+- **Unlimited Playlists:** `MAX_PLAYLIST_ITEMS=0` and `MAX_BATCH_ITEMS=0` in `.env` inspect and queue the full length of any playlist without the legacy 50/100 item cap. Set positive values in `.env` if you want to enforce caps on shared instances.
+- **Persistent Host Downloads (`DOWNLOAD_TTL_MINUTES=0`):** Active downloads stage briefly inside `.mediavault-tmp` and move directly into `HOST_DOWNLOADS_DIR` (`./data/downloads` by default) using sanitized human-readable filenames (with `_(2)`, `_(3)` suffixing on duplicate titles). Playlist batches are automatically grouped into `<Playlist_Title>/` subfolders.
+- **Point Directly to Your OS Downloads Folder:** Set `HOST_DOWNLOADS_DIR=C:/Users/<YourName>/Downloads/MediaVault` in `.env` and recreate `api` and `worker` (`docker compose up -d api worker`) so completed videos/MP3s land straight in your local Downloads folder.
+- **Manual Deletion & Remote Downloads:** Files persist until deleted manually from your host folder or via the delete button (`DELETE /api/jobs/:id`) on `/queue`. `Save File` remains active for phone/remote downloads over Cloudflare Tunnel. If you prefer automatic deletion after 30 minutes, set `DOWNLOAD_TTL_MINUTES=30` in `.env`.

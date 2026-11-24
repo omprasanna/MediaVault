@@ -1,7 +1,8 @@
 const fs = require('fs');
+const path = require('path');
 const { AppError } = require('./errors');
 
-const SAFE_SELECTOR_REGEX = /^[a-zA-Z0-9_+[\]<=.,\-/*()^$~"':\s]+$/;
+const SAFE_SELECTOR_REGEX = /^[a-zA-Z0-9_+@[\]<=.,\-/*()^$~"':\s]+$/;
 
 const DEFAULT_SELECTORS = {
   audio: 'bestaudio/best',
@@ -91,6 +92,13 @@ function buildYtDlpJobArgs({
     '--newline',
     '--no-playlist',
     '--no-warnings',
+    '--continue',
+    '--socket-timeout',
+    '30',
+    '--retries',
+    '5',
+    '--fragment-retries',
+    '5',
   ];
 
   if (process.env.YTDLP_FORCE_IPV4 !== 'false') {
@@ -196,6 +204,92 @@ async function assertSufficientDiskSpace(targetDir) {
   return { freeBytes, minRequiredBytes };
 }
 
+/**
+ * Parses `DOWNLOAD_TTL_MINUTES`, returning `0` (persistent, no expiry) when unset or <= 0.
+ *
+ * @param {string | number | undefined | null} raw
+ * @returns {number}
+ */
+function parseDownloadTtlMinutes(raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return 0;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
+  }
+  return parsed;
+}
+
+/**
+ * Sanitizes a playlist title into a safe single directory segment.
+ *
+ * @param {string} title
+ * @returns {string}
+ */
+function sanitizeFolderName(title) {
+  const clean = String(title || '')
+    .replace(/\.\./g, ' ')
+    .replace(/[\/\\]/g, ' ')
+    .replace(/[^a-zA-Z0-9_\s-]/g, '')
+    .trim()
+    .replace(/\s+/g, '_')
+    .replace(/^[_-]+|[_-]+$/g, '')
+    .slice(0, 80)
+    .replace(/^[_-]+|[_-]+$/g, '');
+
+  return clean || 'Playlist';
+}
+
+/**
+ * Moves a finished download from temporary scratch storage into `targetDir` using
+ * a clean filename, appending `_(2)`, `_(3)`, ... if a collision already exists.
+ *
+ * @param {string} srcPath
+ * @param {string} targetDir
+ * @param {string} desiredFileName
+ * @returns {Promise<{ filePath: string, fileName: string }>}
+ */
+async function moveToUniquePath(srcPath, targetDir, desiredFileName) {
+  await fs.promises.mkdir(targetDir, { recursive: true });
+
+  const safeDesired = path.basename(desiredFileName || 'media_file');
+  const ext = path.extname(safeDesired);
+  const base = path.basename(safeDesired, ext) || 'media_file';
+
+  let destPath = null;
+  for (let attempt = 0; attempt < 1000; attempt += 1) {
+    const candidateName = attempt === 0 ? `${base}${ext}` : `${base}_(${attempt + 1})${ext}`;
+    const candidatePath = path.join(targetDir, candidateName);
+    try {
+      await fs.promises.access(candidatePath);
+    } catch {
+      destPath = candidatePath;
+      break;
+    }
+  }
+
+  if (!destPath) {
+    destPath = path.join(targetDir, `${base}_${Date.now()}${ext}`);
+  }
+
+  try {
+    await fs.promises.rename(srcPath, destPath);
+  } catch (err) {
+    if (err && err.code === 'EXDEV') {
+      await fs.promises.copyFile(srcPath, destPath);
+      await fs.promises.unlink(srcPath).catch(() => {});
+    } else {
+      throw err;
+    }
+  }
+
+  return {
+    filePath: destPath,
+    fileName: path.basename(destPath),
+  };
+}
+
 module.exports = {
   getDefaultFormatSelector,
   enforce1080pSelector,
@@ -203,4 +297,7 @@ module.exports = {
   parseYtDlpProgressLine,
   detectMuxingPhase,
   assertSufficientDiskSpace,
+  parseDownloadTtlMinutes,
+  sanitizeFolderName,
+  moveToUniquePath,
 };

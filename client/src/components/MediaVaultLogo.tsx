@@ -1,0 +1,80 @@
+'use client';
+
+import { useId } from 'react';
+
+interface MediaVaultLogoProps {
+  size?: number;
+  className?: string;
+  title?: string;
+}
+
+export function MediaVaultLogo({
+  size = 32,
+  className = '',
+  title,
+}: MediaVaultLogoProps) {
+  const gradId = useId();
+  const isDecorative = !title;
+
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 32 32"
+      width={size}
+      height={size}
+      fill="none"
+      data-testid="mediavault-logo"
+      role={isDecorative ? undefined : 'img'}
+      aria-label={isDecorative ? undefined : title}
+      aria-hidden={isDecorative ? 'true' : undefined}
+      focusable="false"
+      className={className}
+    >
+      <defs>
+        <linearGradient
+          id={gradId}
+          x1="6.5"
+          y1="7.5"
+          x2="25.5"
+          y2="27"
+          gradientUnits="userSpaceOnUse"
+        >
+          <stop offset="0%" stopColor="var(--accent-primary)" />
+          <stop offset="100%" stopColor="var(--accent-primary-hover)" />
+        </linearGradient>
+      </defs>
+      <rect
+        x="1"
+        y="1"
+        width="30"
+        height="30"
+        rx="7.5"
+        fill="var(--bg-surface-elevated)"
+        stroke="var(--border-default)"
+        strokeWidth="1.2"
+      />
+      <path
+        d="M8.5 7.5H23.5C24.6 7.5 25.5 8.4 25.5 9.5V19.2C25.5 22.8 21.3 25.6 16 27C10.7 25.6 6.5 22.8 6.5 19.2V9.5C6.5 8.4 7.4 7.5 8.5 7.5Z"
+        fill={`url(#${gradId})`}
+      />
+      <path
+        d="M13.6 11.7C13.6 11.1 14.3 10.7 14.8 11.0L20.8 14.5C21.3 14.8 21.3 15.6 20.8 15.9L14.8 19.4C14.3 19.7 13.6 19.3 13.6 18.7V11.7Z"
+        fill="var(--accent-on-primary)"
+      />
+      <path
+        d="M11.7 21.8H20.3"
+        stroke="var(--accent-on-primary)"
+        strokeWidth="1.75"
+        strokeLinecap="round"
+      />
+      <circle
+        cx="24.5"
+        cy="7.5"
+        r="2.2"
+        fill="var(--status-ready-dot)"
+        stroke="var(--bg-surface-elevated)"
+        strokeWidth="1.2"
+      />
+    </svg>
+  );
+}

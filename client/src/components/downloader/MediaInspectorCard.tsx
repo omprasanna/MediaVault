@@ -29,6 +29,10 @@ interface MediaInspectorCardProps {
   sourceUrl: string;
   useCookies: boolean;
   inspectLatencyMs: number | null;
+  mode?: MediaMode | null;
+  onModeChange?: (mode: MediaMode) => void;
+  selectedFormatId?: string | null;
+  onSelectedFormatIdChange?: (formatId: string) => void;
   onJobQueued: (jobIds: string[]) => void;
 }
 
@@ -74,6 +78,10 @@ export function MediaInspectorCard({
   sourceUrl,
   useCookies,
   inspectLatencyMs,
+  mode: controlledMode,
+  onModeChange,
+  selectedFormatId: controlledFormatId,
+  onSelectedFormatIdChange,
   onJobQueued,
 }: MediaInspectorCardProps) {
   const videoTabRef = useRef<HTMLButtonElement>(null);
@@ -92,8 +100,12 @@ export function MediaInspectorCard({
     [media.formats]
   );
 
-  const [mode, setMode] = useState<MediaMode>(videoFormats.length > 0 ? 'video' : 'audio');
-  const [selectedFormatId, setSelectedFormatId] = useState<string>('');
+  const fallbackMode: MediaMode = videoFormats.length > 0 ? 'video' : 'audio';
+  const isModeControlled = onModeChange !== undefined;
+  const isFormatControlled = onSelectedFormatIdChange !== undefined;
+
+  const [localMode, setLocalMode] = useState<MediaMode>(fallbackMode);
+  const [localFormatId, setLocalFormatId] = useState<string>('');
   const [imgFailed, setImgFailed] = useState<boolean>(false);
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -103,27 +115,53 @@ export function MediaInspectorCard({
     proxyUrl?: string;
   } | null>(null);
 
-  // Reset component selection whenever a new inspection result arrives
+  // Reset transient card state (and local uncontrolled selections) when a new inspection arrives
   useEffect(() => {
-    const initialMode: MediaMode = videoFormats.length > 0 ? 'video' : 'audio';
-    const initialPool = initialMode === 'video' ? videoFormats : audioFormats;
-    setMode(initialMode);
-    setSelectedFormatId(initialPool[0]?.formatId || '');
+    if (!isModeControlled) {
+      setLocalMode(fallbackMode);
+    }
+    if (!isFormatControlled) {
+      const initialPool = fallbackMode === 'video' ? videoFormats : audioFormats;
+      setLocalFormatId(initialPool[0]?.formatId || '');
+    }
     setImgFailed(false);
     setActionError(null);
     setActionSuccess(null);
-  }, [media, videoFormats, audioFormats]);
+  }, [audioFormats, fallbackMode, isFormatControlled, isModeControlled, media, videoFormats]);
+
+  const requestedMode = isModeControlled ? controlledMode ?? fallbackMode : localMode;
+  const mode: MediaMode =
+    requestedMode === 'video' && videoFormats.length === 0 && audioFormats.length > 0
+      ? 'audio'
+      : requestedMode === 'audio' && audioFormats.length === 0 && videoFormats.length > 0
+        ? 'video'
+        : requestedMode;
 
   const activeFormats = mode === 'video' ? videoFormats : audioFormats;
+  const resolvedFormatId = isFormatControlled
+    ? controlledFormatId || ''
+    : localFormatId;
   const selectedFormat =
-    activeFormats.find((fmt) => fmt.formatId === selectedFormatId) || activeFormats[0];
+    activeFormats.find((fmt) => fmt.formatId === resolvedFormatId) || activeFormats[0];
+
+  function updateSelectedFormat(formatId: string) {
+    if (onSelectedFormatIdChange) {
+      onSelectedFormatIdChange(formatId);
+    } else {
+      setLocalFormatId(formatId);
+    }
+  }
 
   function handleModeChange(nextMode: MediaMode, moveFocus = false) {
-    setMode(nextMode);
+    if (onModeChange) {
+      onModeChange(nextMode);
+    } else {
+      setLocalMode(nextMode);
+    }
     setActionError(null);
     setActionSuccess(null);
     const nextPool = nextMode === 'video' ? videoFormats : audioFormats;
-    setSelectedFormatId(nextPool[0]?.formatId || '');
+    updateSelectedFormat(nextPool[0]?.formatId || '');
     if (moveFocus) {
       if (nextMode === 'video') {
         videoTabRef.current?.focus();
@@ -418,7 +456,7 @@ export function MediaInspectorCard({
                         value={fmt.formatId}
                         checked={isSelected}
                         onChange={() => {
-                          setSelectedFormatId(fmt.formatId);
+                          updateSelectedFormat(fmt.formatId);
                           setActionError(null);
                           setActionSuccess(null);
                         }}

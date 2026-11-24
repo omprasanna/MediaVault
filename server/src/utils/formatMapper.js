@@ -72,6 +72,78 @@ function classifyAudioCodec(acodec) {
   return a.split('.')[0] || null;
 }
 
+const NON_AUDIO_EXTS = new Set([
+  'mhtml',
+  'jpg',
+  'jpeg',
+  'png',
+  'webp',
+  'vtt',
+  'srt',
+  'ttml',
+  'ass',
+  'lrc',
+]);
+
+function inferAudioCodec(format) {
+  const direct = classifyAudioCodec(format?.acodec);
+  if (direct) return direct;
+  if (!format || format.acodec === 'none') return null;
+
+  const id = String(format.format_id || '').toLowerCase();
+  const audioExt = String(format.audio_ext || '').toLowerCase();
+  const ext = String(format.ext || '').toLowerCase();
+
+  if (
+    /(?:^|[_-])(aac|mp4a|m4a)(?:$|[_-])/i.test(id) ||
+    audioExt === 'm4a' ||
+    audioExt === 'aac' ||
+    (format.vcodec === 'none' && (ext === 'm4a' || ext === 'mp4'))
+  ) {
+    return 'aac';
+  }
+  if (/opus/i.test(id) || audioExt === 'opus' || ext === 'opus') {
+    return 'opus';
+  }
+  if (/vorbis/i.test(id) || audioExt === 'ogg' || ext === 'ogg') {
+    return 'vorbis';
+  }
+  if (/mp3/i.test(id) || audioExt === 'mp3' || ext === 'mp3') {
+    return 'mp3';
+  }
+  return null;
+}
+
+function audioQualityHintScore(format) {
+  let score = 0;
+  const note = String(format?.format_note || '');
+  if (/\bhigh\b/i.test(note)) score += 10;
+  else if (/\bmedium\b/i.test(note)) score += 5;
+  else if (/\blow\b/i.test(note)) score -= 5;
+
+  const id = String(format?.format_id || '');
+  const qMatch = id.match(/(?:^|[_-])q(\d+)(?:$|[_-])/i);
+  if (qMatch) {
+    score += Number(qMatch[1]) || 0;
+  }
+  return score;
+}
+
+function getEffectiveVideoResolution(format) {
+  const numericHeight =
+    typeof format?.height === 'number' && Number.isFinite(format.height) && format.height > 0
+      ? format.height
+      : null;
+  if (numericHeight === null) {
+    return null;
+  }
+  const numericWidth =
+    typeof format?.width === 'number' && Number.isFinite(format.width) && format.width > 0
+      ? format.width
+      : null;
+  return numericWidth !== null ? Math.min(numericWidth, numericHeight) : numericHeight;
+}
+
 function isProgressiveHttp(format) {
   if (typeof format?.url !== 'string' || !/^https?:\/\//i.test(format.url)) {
     return false;
@@ -127,7 +199,7 @@ function extractSafeHeaders(format, rawData) {
 
 function pickBestAudio(audioStreams, targetCodec = null) {
   const filtered = targetCodec
-    ? audioStreams.filter((a) => classifyAudioCodec(a.acodec) === targetCodec)
+    ? audioStreams.filter((a) => inferAudioCodec(a) === targetCodec)
     : audioStreams;
 
   if (filtered.length === 0) return null;
@@ -143,7 +215,11 @@ function pickBestAudio(audioStreams, targetCodec = null) {
 
     const aBitrate = Number(a.abr || a.tbr || 0);
     const bBitrate = Number(b.abr || b.tbr || 0);
-    return bBitrate - aBitrate;
+    if (aBitrate !== bBitrate) {
+      return bBitrate - aBitrate;
+    }
+
+    return audioQualityHintScore(b) - audioQualityHintScore(a);
   })[0];
 }
 
@@ -265,44 +341,48 @@ function mapInspectResponse(rawData, { platform, sourceUrl }) {
       continue;
     }
 
-    const numericHeight =
-      typeof f.height === 'number' && Number.isFinite(f.height) && f.height > 0
-        ? f.height
-        : null;
+    const effectiveHeight = getEffectiveVideoResolution(f);
 
-    // Strictly enforce <= 1080p video cap.
-    if (numericHeight !== null && numericHeight > MAX_VIDEO_HEIGHT) {
+    // Strictly enforce <= 1080p video cap (short-edge resolution handles portrait video cleanly).
+    if (effectiveHeight !== null && effectiveHeight > MAX_VIDEO_HEIGHT) {
       continue;
     }
 
+    const rawExt = String(f.ext || '').toLowerCase();
     const fallbackCombined =
       !f.vcodec &&
       !f.acodec &&
-      ['mp4', 'webm'].includes(String(f.ext || '').toLowerCase()) &&
-      Boolean(numericHeight || isProgressiveHttp(f));
+      ['mp4', 'webm'].includes(rawExt) &&
+      Boolean(effectiveHeight || isProgressiveHttp(f));
+
+    const fallbackAudioOnly =
+      f.vcodec === 'none' &&
+      f.acodec !== 'none' &&
+      !NON_AUDIO_EXTS.has(rawExt) &&
+      Boolean(f.format_id || f.url);
 
     const hasVideo = (Boolean(f.vcodec) && f.vcodec !== 'none') || fallbackCombined;
-    const hasAudio = (Boolean(f.acodec) && f.acodec !== 'none') || fallbackCombined;
+    const hasAudio =
+      (Boolean(f.acodec) && f.acodec !== 'none') || fallbackCombined || fallbackAudioOnly;
 
     if (hasVideo && hasAudio) {
-      const rawExt = String(f.ext || '').toLowerCase();
       const vcodec = classifyVideoCodec(f.vcodec);
-      const acodec = classifyAudioCodec(f.acodec);
+      const acodec = inferAudioCodec(f);
 
       if (isProgressiveHttp(f)) {
         const container = ['mp4', 'webm'].includes(rawExt) ? rawExt : 'mp4';
-        const dedupeKey = `${numericHeight || 0}:${container}`;
+        const dedupeKey = `${effectiveHeight || 0}:${container}`;
         const existing = directBest.get(dedupeKey);
         if (!existing || Number(f.tbr || 0) > Number(existing._tbr || 0)) {
           directBest.set(dedupeKey, {
             formatId: String(f.format_id || 'direct'),
             formatSelector: String(f.format_id || 'best[height<=1080]'),
-            label: `${numericHeight ? `${numericHeight}p ` : ''}${container.toUpperCase()} (Direct Stream)`,
+            label: `${effectiveHeight ? `${effectiveHeight}p ` : ''}${container.toUpperCase()} (Direct Stream)`,
             container,
             mode: 'video',
             delivery: 'direct',
             isDirect: true,
-            height: numericHeight,
+            height: effectiveHeight,
             fps: f.fps ? Number(f.fps) : null,
             vcodec,
             acodec,
@@ -314,18 +394,18 @@ function mapInspectResponse(rawData, { platform, sourceUrl }) {
         }
       } else {
         const container = ['mp4', 'webm', 'mkv'].includes(rawExt) ? rawExt : 'mp4';
-        const dedupeKey = `${numericHeight || 0}:${container}:${vcodec || 'auto'}`;
+        const dedupeKey = `${effectiveHeight || 0}:${container}:${vcodec || 'auto'}`;
         const existing = workerBest.get(dedupeKey);
         if (!existing || isBetterVideoCandidate(f, existing._raw)) {
           workerBest.set(dedupeKey, {
             formatId: String(f.format_id),
             formatSelector: String(f.format_id),
-            label: `${numericHeight ? `${numericHeight}p${numericHeight >= 720 ? ' HD' : ''} ` : ''}(${container.toUpperCase()} Stream-Copy)`,
+            label: `${effectiveHeight ? `${effectiveHeight}p${effectiveHeight >= 720 ? ' HD' : ''} ` : ''}(${container.toUpperCase()} Stream-Copy)`,
             container,
             mode: 'video',
             delivery: 'worker',
             isDirect: false,
-            height: numericHeight,
+            height: effectiveHeight,
             fps: f.fps ? Number(f.fps) : null,
             vcodec,
             acodec,
@@ -342,9 +422,9 @@ function mapInspectResponse(rawData, { platform, sourceUrl }) {
       continue;
     }
 
-    if (hasVideo && !hasAudio && numericHeight !== null) {
+    if (hasVideo && !hasAudio && effectiveHeight !== null) {
       const vFamily = classifyVideoCodec(f.vcodec) || 'unknown';
-      const key = `${numericHeight}:${vFamily}`;
+      const key = `${effectiveHeight}:${vFamily}`;
       const existing = videoOnlyBestByHeightCodec.get(key);
       if (isBetterVideoCandidate(f, existing)) {
         videoOnlyBestByHeightCodec.set(key, f);
@@ -358,7 +438,10 @@ function mapInspectResponse(rawData, { platform, sourceUrl }) {
 
   for (const v of videoOnlyBestByHeightCodec.values()) {
     const vFamily = classifyVideoCodec(v.vcodec);
-    const height = Number(v.height);
+    const height = getEffectiveVideoResolution(v);
+    if (height === null) {
+      continue;
+    }
     const hdTag = height >= 720 ? ' HD' : '';
 
     let container;
@@ -398,7 +481,7 @@ function mapInspectResponse(rawData, { platform, sourceUrl }) {
         height,
         fps: v.fps ? Number(v.fps) : null,
         vcodec: vFamily,
-        acodec: classifyAudioCodec(audio.acodec),
+        acodec: inferAudioCodec(audio),
         filesize: vSize > 0 && aSize > 0 ? vSize + aSize : null,
         _raw: v,
       });

@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from 'next';
 import { Inter, JetBrains_Mono } from 'next/font/google';
 import { AppShell } from '@/components/AppShell';
+import { SWRProvider } from '@/components/SWRProvider';
 import { ThemeProvider } from '@/components/ThemeProvider';
 import './globals.css';
 
@@ -43,7 +44,9 @@ export default function RootLayout({
     >
       <body className="min-h-screen bg-canvas font-sans text-ink-primary antialiased">
         <ThemeProvider>
-          <AppShell>{children}</AppShell>
+          <SWRProvider>
+            <AppShell>{children}</AppShell>
+          </SWRProvider>
         </ThemeProvider>
       </body>
     </html>

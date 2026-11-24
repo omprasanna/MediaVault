@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import useSWR, { useSWRConfig } from 'swr';
 import {
   Activity,
   ArrowUpRight,
@@ -24,24 +25,47 @@ import {
   loadRecentInspections,
   saveRecentInspection,
   type InspectResult,
+  type MediaMode,
   type RecentInspectionItem,
 } from '@/lib/mediaTypes';
+import {
+  revalidateJobsQueries,
+  swrJsonFetcher,
+  useDownloaderState,
+} from '@/lib/swrStore';
 
 export default function DownloaderPage() {
-  const [url, setUrl] = useState<string>('');
-  const [useCookies, setUseCookies] = useState<boolean>(false);
-  const [singleItemOnly, setSingleItemOnly] = useState<boolean>(false);
+  const { mutate } = useSWRConfig();
+  const { state, updateState, resetState } = useDownloaderState();
 
+  const [urlInput, setUrlInput] = useState<string>(() => state.url);
   const [inspecting, setInspecting] = useState<boolean>(false);
   const [inspectError, setInspectError] = useState<string | null>(null);
-  const [inspectResult, setInspectResult] = useState<InspectResult | null>(null);
-  const [inspectedUrl, setInspectedUrl] = useState<string>('');
-  const [inspectLatencyMs, setInspectLatencyMs] = useState<number | null>(null);
-
   const [recentInspections, setRecentInspections] = useState<RecentInspectionItem[]>([]);
-  const [daemonState, setDaemonState] = useState<'ready' | 'offline' | 'checking'>('checking');
   const [jobsRefreshTick, setJobsRefreshTick] = useState<number>(0);
-  const [trackedJobIds, setTrackedJobIds] = useState<string[]>([]);
+
+  const {
+    data: healthData,
+    error: healthError,
+    isLoading: healthLoading,
+  } = useSWR<{ status?: string }>('/api/health', swrJsonFetcher, {
+    revalidateOnFocus: false,
+    shouldRetryOnError: false,
+  });
+
+  const daemonState: 'ready' | 'offline' | 'checking' = healthError
+    ? 'offline'
+    : healthData
+      ? healthData.status && healthData.status !== 'ok'
+        ? 'offline'
+        : 'ready'
+      : healthLoading
+        ? 'checking'
+        : 'offline';
+
+  useEffect(() => {
+    setUrlInput(state.url);
+  }, [state.url]);
 
   useEffect(() => {
     setRecentInspections(loadRecentInspections());
@@ -49,40 +73,27 @@ export default function DownloaderPage() {
     if (typeof window !== 'undefined') {
       const prefillUrl = new URLSearchParams(window.location.search).get('url');
       if (prefillUrl && prefillUrl.trim()) {
-        setUrl(prefillUrl.trim());
+        const normalized = prefillUrl.trim();
+        setUrlInput(normalized);
+        updateState({ url: normalized });
       }
     }
+  }, [updateState]);
 
-    const controller = new AbortController();
-    async function checkHealth() {
-      try {
-        const res = await fetch('/api/health', {
-          cache: 'no-store',
-          signal: controller.signal,
-        });
-        if (!controller.signal.aborted) {
-          setDaemonState(res.ok ? 'ready' : 'offline');
-        }
-      } catch (err) {
-        if (err instanceof Error && err.name === 'AbortError') {
-          return;
-        }
-        setDaemonState('offline');
-      }
-    }
-
-    void checkHealth();
-    return () => controller.abort();
-  }, []);
+  function handleUrlChange(nextUrl: string) {
+    setUrlInput(nextUrl);
+    updateState({ url: nextUrl });
+  }
 
   async function runInspect(targetUrl?: string) {
-    const candidate = (targetUrl ?? url).trim();
+    const candidate = (targetUrl ?? urlInput).trim();
     if (!candidate || inspecting) {
       return;
     }
 
     if (targetUrl !== undefined) {
-      setUrl(candidate);
+      setUrlInput(candidate);
+      updateState({ url: candidate });
     }
 
     setInspecting(true);
@@ -95,8 +106,8 @@ export default function DownloaderPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           url: candidate,
-          useCookies,
-          includePlaylist: !singleItemOnly,
+          useCookies: state.useCookies,
+          includePlaylist: !state.singleItemOnly,
         }),
       });
 
@@ -109,9 +120,36 @@ export default function DownloaderPage() {
       const data = (await res.json()) as InspectResult;
       const elapsed = Math.max(1, Math.round(performance.now() - startedAt));
 
-      setInspectResult(data);
-      setInspectedUrl(candidate);
-      setInspectLatencyMs(elapsed);
+      const defaultPlaylistPresetId = data.isPlaylist
+        ? /music\.youtube\.com/i.test(data.playlistUrl)
+          ? 'mp3-320'
+          : 'mp4-1080'
+        : null;
+      const defaultPlaylistSelectedIds = data.isPlaylist
+        ? data.items.map((item) => item.id)
+        : null;
+      const defaultSingleMode: MediaMode | null = !data.isPlaylist
+        ? data.formats.some((fmt) => fmt.mode === 'video')
+          ? 'video'
+          : 'audio'
+        : null;
+      const defaultSingleFormatId: string | null =
+        !data.isPlaylist && defaultSingleMode
+          ? data.formats.find((fmt) => fmt.mode === defaultSingleMode)?.formatId ?? null
+          : null;
+
+      setUrlInput(candidate);
+      updateState((prev) => ({
+        ...prev,
+        url: candidate,
+        inspectResult: data,
+        inspectedUrl: candidate,
+        inspectLatencyMs: elapsed,
+        playlistPresetId: defaultPlaylistPresetId,
+        playlistSelectedIds: defaultPlaylistSelectedIds,
+        singleMode: defaultSingleMode,
+        singleFormatId: defaultSingleFormatId,
+      }));
 
       const title = data.isPlaylist ? data.playlistTitle : data.title;
       const updatedRecent = saveRecentInspection({
@@ -130,18 +168,20 @@ export default function DownloaderPage() {
   }
 
   function handleResetToEmptyState() {
-    setUrl('');
+    setUrlInput('');
     setInspectError(null);
-    setInspectResult(null);
-    setInspectedUrl('');
-    setInspectLatencyMs(null);
+    resetState();
   }
 
   function handleJobsQueued(jobIds: string[]) {
     if (jobIds.length > 0) {
-      setTrackedJobIds((prev) => Array.from(new Set([...jobIds, ...prev])));
+      updateState((prev) => ({
+        ...prev,
+        trackedJobIds: Array.from(new Set([...jobIds, ...prev.trackedJobIds])),
+      }));
     }
     setJobsRefreshTick((prev) => prev + 1);
+    void revalidateJobsQueries(mutate);
   }
 
   const daemonDotClass =
@@ -152,7 +192,8 @@ export default function DownloaderPage() {
         : 'bg-muxing-dot';
 
   // Active Result State (Single Video OR Playlist Batch)
-  if (inspectResult) {
+  if (state.inspectResult) {
+    const inspectResult = state.inspectResult;
     const containerPadding = inspectResult.isPlaylist
       ? 'pb-36 md:pb-24'
       : 'pb-24 md:pb-8';
@@ -161,12 +202,12 @@ export default function DownloaderPage() {
       <div className={`mx-auto flex w-full max-w-4xl flex-col gap-4 px-4 py-5 md:px-6 md:py-6 ${containerPadding}`}>
         <UrlInputCard
           variant="compact"
-          url={url}
-          onUrlChange={setUrl}
-          useCookies={useCookies}
-          onUseCookiesChange={setUseCookies}
-          singleItemOnly={singleItemOnly}
-          onSingleItemOnlyChange={setSingleItemOnly}
+          url={urlInput}
+          onUrlChange={handleUrlChange}
+          useCookies={state.useCookies}
+          onUseCookiesChange={(checked) => updateState({ useCookies: checked })}
+          singleItemOnly={state.singleItemOnly}
+          onSingleItemOnlyChange={(checked) => updateState({ singleItemOnly: checked })}
           loading={inspecting}
           error={inspectError}
           onClearError={() => setInspectError(null)}
@@ -183,11 +224,15 @@ export default function DownloaderPage() {
           <>
             <DockedActiveJobBar
               refreshTrigger={jobsRefreshTick}
-              trackedJobIds={trackedJobIds}
+              trackedJobIds={state.trackedJobIds}
             />
             <PlaylistPicker
               playlist={inspectResult}
-              useCookies={useCookies}
+              useCookies={state.useCookies}
+              presetId={state.playlistPresetId}
+              onPresetChange={(nextId) => updateState({ playlistPresetId: nextId })}
+              selectedIds={state.playlistSelectedIds}
+              onSelectedIdsChange={(ids) => updateState({ playlistSelectedIds: ids })}
               onBatchQueued={(jobIds) => handleJobsQueued(jobIds)}
             />
           </>
@@ -195,14 +240,20 @@ export default function DownloaderPage() {
           <>
             <MediaInspectorCard
               media={inspectResult}
-              sourceUrl={inspectedUrl}
-              useCookies={useCookies}
-              inspectLatencyMs={inspectLatencyMs}
+              sourceUrl={state.inspectedUrl}
+              useCookies={state.useCookies}
+              inspectLatencyMs={state.inspectLatencyMs}
+              mode={state.singleMode}
+              onModeChange={(nextMode) => updateState({ singleMode: nextMode })}
+              selectedFormatId={state.singleFormatId}
+              onSelectedFormatIdChange={(formatId) =>
+                updateState({ singleFormatId: formatId })
+              }
               onJobQueued={handleJobsQueued}
             />
             <DockedActiveJobBar
               refreshTrigger={jobsRefreshTick}
-              trackedJobIds={trackedJobIds}
+              trackedJobIds={state.trackedJobIds}
             />
           </>
         )}
@@ -266,12 +317,12 @@ export default function DownloaderPage() {
         {/* Hero URL Input Card */}
         <UrlInputCard
           variant="hero"
-          url={url}
-          onUrlChange={setUrl}
-          useCookies={useCookies}
-          onUseCookiesChange={setUseCookies}
-          singleItemOnly={singleItemOnly}
-          onSingleItemOnlyChange={setSingleItemOnly}
+          url={urlInput}
+          onUrlChange={handleUrlChange}
+          useCookies={state.useCookies}
+          onUseCookiesChange={(checked) => updateState({ useCookies: checked })}
+          singleItemOnly={state.singleItemOnly}
+          onSingleItemOnlyChange={(checked) => updateState({ singleItemOnly: checked })}
           loading={inspecting}
           error={inspectError}
           onClearError={() => setInspectError(null)}
@@ -381,7 +432,7 @@ export default function DownloaderPage() {
               <div className="min-w-0">
                 <p className="text-xs font-semibold text-ink-primary">Batch Playlists</p>
                 <p className="mt-0.5 text-[11px] leading-snug text-ink-secondary">
-                  Select tracks, pick a shared format, and enqueue up to 50 items.
+                  Select tracks, pick a shared format, and enqueue entire playlists.
                 </p>
               </div>
             </div>
@@ -417,7 +468,7 @@ export default function DownloaderPage() {
       <div className="w-full max-w-4xl">
         <DockedActiveJobBar
           refreshTrigger={jobsRefreshTick}
-          trackedJobIds={trackedJobIds}
+          trackedJobIds={state.trackedJobIds}
         />
       </div>
     </div>

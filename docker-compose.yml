@@ -57,9 +57,12 @@ services:
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       DOWNLOADS_DIR: ${DOWNLOADS_DIR:-/data/downloads}
       COOKIES_DIR: ${COOKIES_DIR:-/data/cookies}
+      DOWNLOAD_TTL_MINUTES: ${DOWNLOAD_TTL_MINUTES:-30}
+      MAX_PLAYLIST_ITEMS: ${MAX_PLAYLIST_ITEMS:-0}
+      MAX_BATCH_ITEMS: ${MAX_BATCH_ITEMS:-0}
       MIN_FREE_DISK_BYTES: ${MIN_FREE_DISK_BYTES:-2147483648}
     volumes:
-      - ./data/downloads:/data/downloads:ro
+      - ${HOST_DOWNLOADS_DIR:-./data/downloads}:/data/downloads
       - ./data/cookies:/data/cookies
     depends_on:
       mongo:
@@ -98,7 +101,7 @@ services:
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
       MIN_FREE_DISK_BYTES: ${MIN_FREE_DISK_BYTES:-2147483648}
     volumes:
-      - ./data/downloads:/data/downloads
+      - ${HOST_DOWNLOADS_DIR:-./data/downloads}:/data/downloads
       - ./data/cookies:/data/cookies:ro
     depends_on:
       mongo:

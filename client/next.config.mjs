@@ -2,6 +2,7 @@
 const internalApiUrl = (process.env.INTERNAL_API_URL || 'http://api:5000').replace(/\/+$/, '');
 
 const nextConfig = {
+  allowedDevOrigins: ['*.trycloudflare.com'],
   output: 'standalone',
   images: {
     remotePatterns: [

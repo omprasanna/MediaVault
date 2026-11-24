@@ -7,6 +7,7 @@ const { connectDB, disconnectDB } = require('./config/db');
 const Batch = require('./models/Batch');
 const Job = require('./models/Job');
 const {
+  JOB_CONTROL_CHANNEL,
   MEDIA_QUEUE_NAME,
   clearJobProgressCache,
   createRedisConnection,
@@ -19,7 +20,10 @@ const {
   assertSufficientDiskSpace,
   buildYtDlpJobArgs,
   detectMuxingPhase,
+  moveToUniquePath,
+  parseDownloadTtlMinutes,
   parseYtDlpProgressLine,
+  sanitizeFolderName,
 } = require('./utils/workerHelpers');
 const { prepareCookieArg, validateMediaUrl } = require('./utils/ytdlp');
 
@@ -28,14 +32,20 @@ const WORKER_CONCURRENCY = Math.min(
   Math.max(1, Number(process.env.WORKER_CONCURRENCY || 2))
 );
 const DOWNLOADS_DIR = path.resolve(process.env.DOWNLOADS_DIR || '/data/downloads');
-const DOWNLOAD_TTL_MS = Number(process.env.DOWNLOAD_TTL_MINUTES || 30) * 60 * 1000;
+const TMP_DOWNLOADS_DIR = path.join(DOWNLOADS_DIR, '.mediavault-tmp');
+const DOWNLOAD_TTL_MINUTES = parseDownloadTtlMinutes(process.env.DOWNLOAD_TTL_MINUTES);
+const DOWNLOAD_TTL_MS = DOWNLOAD_TTL_MINUTES * 60 * 1000;
+const ORPHAN_TMP_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MINUTES || 5) * 60 * 1000;
 const JOB_TIMEOUT_MS = 30 * 60 * 1000;
+const STALL_TIMEOUT_MS = 90 * 1000;
 
+const activeJobControllers = new Map();
 let isCleanupRunning = false;
 let cleanupTimer = null;
 let workerInstance = null;
 let workerConnection = null;
+let controlSubscriber = null;
 
 function isSafeDownloadPath(filePath) {
   if (!filePath || typeof filePath !== 'string') return false;
@@ -56,10 +66,10 @@ async function unlinkIfSafe(filePath) {
 
 async function cleanupPartialFiles(jobId) {
   try {
-    const entries = await fs.promises.readdir(DOWNLOADS_DIR);
+    const entries = await fs.promises.readdir(TMP_DOWNLOADS_DIR);
     for (const entry of entries) {
       if (entry.startsWith(`${jobId}.`)) {
-        await unlinkIfSafe(path.join(DOWNLOADS_DIR, entry));
+        await unlinkIfSafe(path.join(TMP_DOWNLOADS_DIR, entry));
       }
     }
   } catch (err) {
@@ -70,7 +80,7 @@ async function cleanupPartialFiles(jobId) {
 }
 
 async function findJobOutputFile(jobId, preferredContainer) {
-  const preferredPath = path.join(DOWNLOADS_DIR, `${jobId}.${preferredContainer}`);
+  const preferredPath = path.join(TMP_DOWNLOADS_DIR, `${jobId}.${preferredContainer}`);
   try {
     const stats = await fs.promises.stat(preferredPath);
     if (stats.isFile()) {
@@ -80,7 +90,7 @@ async function findJobOutputFile(jobId, preferredContainer) {
     // Fall back to scanning prefix in case yt-dlp resolved a different extension.
   }
 
-  const entries = await fs.promises.readdir(DOWNLOADS_DIR);
+  const entries = await fs.promises.readdir(TMP_DOWNLOADS_DIR);
   for (const entry of entries) {
     if (
       entry.startsWith(`${jobId}.`) &&
@@ -88,7 +98,7 @@ async function findJobOutputFile(jobId, preferredContainer) {
       !entry.endsWith('.ytdl') &&
       !entry.includes('.temp.')
     ) {
-      const candidate = path.join(DOWNLOADS_DIR, entry);
+      const candidate = path.join(TMP_DOWNLOADS_DIR, entry);
       const stats = await fs.promises.stat(candidate);
       if (stats.isFile()) {
         return candidate;
@@ -100,8 +110,8 @@ async function findJobOutputFile(jobId, preferredContainer) {
 }
 
 /**
- * Removes expired download files from `/data/downloads` and marks corresponding
- * MongoDB Job documents as `expired`.
+ * Cleans stale staging files from `.mediavault-tmp` and, when `DOWNLOAD_TTL_MINUTES > 0`,
+ * removes expired finished files from `/data/downloads` and marks jobs `expired`.
  */
 async function runStorageCleanup() {
   if (isCleanupRunning) return;
@@ -109,8 +119,30 @@ async function runStorageCleanup() {
 
   try {
     await fs.promises.mkdir(DOWNLOADS_DIR, { recursive: true });
-    const now = new Date();
+    await fs.promises.mkdir(TMP_DOWNLOADS_DIR, { recursive: true });
+    const nowMs = Date.now();
 
+    const tmpEntries = await fs.promises.readdir(TMP_DOWNLOADS_DIR);
+    for (const entry of tmpEntries) {
+      if (entry === '.gitkeep') {
+        continue;
+      }
+      const tmpPath = path.join(TMP_DOWNLOADS_DIR, entry);
+      try {
+        const stats = await fs.promises.stat(tmpPath);
+        if (stats.isFile() && nowMs - stats.mtimeMs > ORPHAN_TMP_MAX_AGE_MS) {
+          await unlinkIfSafe(tmpPath);
+        }
+      } catch {
+        // Ignore transient temp file stat errors
+      }
+    }
+
+    if (DOWNLOAD_TTL_MS <= 0) {
+      return;
+    }
+
+    const now = new Date();
     const expiredJobs = await Job.find({
       status: 'ready',
       expiresAt: { $ne: null, $lte: now },
@@ -127,8 +159,6 @@ async function runStorageCleanup() {
     }
 
     const entries = await fs.promises.readdir(DOWNLOADS_DIR);
-    const nowMs = Date.now();
-
     for (const entry of entries) {
       if (entry === '.gitkeep' || entry.startsWith('.')) {
         continue;
@@ -183,7 +213,7 @@ async function updateBatchRollup(batchId) {
   );
 }
 
-function runYtDlpDownload({ args, onProgress, onMuxing }) {
+function runYtDlpDownload({ args, onProgress, onMuxing, onController }) {
   return new Promise((resolve, reject) => {
     const child = spawn('yt-dlp', args, {
       shell: false,
@@ -193,32 +223,71 @@ function runYtDlpDownload({ args, onProgress, onMuxing }) {
     let stdoutRemainder = '';
     let stderrText = '';
     let settled = false;
+    let stoppedReason = null;
     let forceKillTimer = null;
+    let stallTimer = null;
 
     const finish = (err, result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeoutTimer);
+      if (stallTimer) clearTimeout(stallTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
       if (err) reject(err);
       else resolve(result);
     };
 
     const killChild = () => {
-      child.kill('SIGTERM');
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // Ignore if already exited
+      }
       forceKillTimer = setTimeout(() => {
         if (!child.killed) {
-          child.kill('SIGKILL');
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            // Ignore
+          }
         }
       }, 3000);
       forceKillTimer.unref();
     };
+
+    const resetStallTimer = () => {
+      if (stallTimer) {
+        clearTimeout(stallTimer);
+      }
+      stallTimer = setTimeout(() => {
+        if (settled || stoppedReason) return;
+        killChild();
+        const stallErr = new Error(
+          'Network connection lost or stalled — click Retry to resume.'
+        );
+        stallErr.code = 'NETWORK_STALLED';
+        finish(stallErr);
+      }, STALL_TIMEOUT_MS);
+      stallTimer.unref();
+    };
+
+    if (typeof onController === 'function') {
+      onController({
+        stop(reason) {
+          if (settled || stoppedReason) return;
+          stoppedReason = reason;
+          killChild();
+        },
+      });
+    }
 
     const timeoutTimer = setTimeout(() => {
       killChild();
       finish(new Error('yt-dlp download timed out after 30 minutes.'));
     }, JOB_TIMEOUT_MS);
     timeoutTimer.unref();
+
+    resetStallTimer();
 
     const processLine = (line) => {
       const trimmed = line.trim();
@@ -234,6 +303,7 @@ function runYtDlpDownload({ args, onProgress, onMuxing }) {
     };
 
     child.stdout.on('data', (chunk) => {
+      resetStallTimer();
       const combined = stdoutRemainder + chunk.toString('utf8');
       const lines = combined.split(/\r?\n|\r/);
       stdoutRemainder = lines.pop() || '';
@@ -243,6 +313,7 @@ function runYtDlpDownload({ args, onProgress, onMuxing }) {
     });
 
     child.stderr.on('data', (chunk) => {
+      resetStallTimer();
       if (stderrText.length < 64 * 1024) {
         stderrText += chunk.toString('utf8');
       }
@@ -259,6 +330,11 @@ function runYtDlpDownload({ args, onProgress, onMuxing }) {
       }
       if (settled) return;
 
+      if (stoppedReason) {
+        finish(null, { code, stoppedReason });
+        return;
+      }
+
       if (code !== 0) {
         const lines = stderrText
           .split(/\r?\n/)
@@ -272,7 +348,7 @@ function runYtDlpDownload({ args, onProgress, onMuxing }) {
         return;
       }
 
-      finish(null, { code });
+      finish(null, { code, stoppedReason: null });
     });
   });
 }
@@ -284,21 +360,46 @@ async function processJob(bullJob) {
   }
 
   const job = await Job.findById(jobId);
-  if (!job || job.status === 'cancelled') {
+  if (!job || ['cancelled', 'paused', 'ready'].includes(job.status)) {
     return;
   }
 
   let currentStatus = 'downloading';
-  let lastDbProgress = 0;
+  let maxProgress = Math.min(94, Math.max(0, Number(job.progress || 0)));
+  let lastDbProgress = maxProgress;
   let lastDbWriteMs = 0;
   let lastCacheWriteMs = 0;
-  let maxProgress = 0;
   let reachedMuxingPhase = false;
+  let pausedByRequest = false;
+  let cancelledForRetry = false;
+  let cancelledByRequest = false;
+  let activeDownloadController = null;
+
+  activeJobControllers.set(jobId, {
+    pause: () => {
+      if (cancelledForRetry || cancelledByRequest) return;
+      pausedByRequest = true;
+      activeDownloadController?.stop('paused');
+    },
+    cancelForRetry: () => {
+      if (cancelledByRequest) return;
+      cancelledForRetry = true;
+      activeDownloadController?.stop('retry');
+    },
+    cancel: () => {
+      cancelledByRequest = true;
+      activeDownloadController?.stop('cancelled');
+    },
+  });
 
   const publishProgress = async (
     { status, progress, downloadSpeed = null, eta = null },
     forceDb = false
   ) => {
+    if (pausedByRequest || cancelledForRetry || cancelledByRequest) {
+      return;
+    }
+
     const now = Date.now();
     const statusChanged = status !== currentStatus;
     currentStatus = status;
@@ -331,6 +432,17 @@ async function processJob(bullJob) {
     }
   };
 
+  const persistPausedState = async () => {
+    await Job.findByIdAndUpdate(jobId, {
+      status: 'paused',
+      progress: maxProgress,
+      downloadSpeed: null,
+      eta: null,
+      errorMessage: null,
+    }).catch(() => {});
+    await clearJobProgressCache(jobId).catch(() => {});
+  };
+
   let cookieHandle = null;
 
   try {
@@ -353,12 +465,27 @@ async function processJob(bullJob) {
     }
     const cookiePath = cookieHandle ? cookieHandle.cookiePath : null;
 
+    const latestBeforeSpawn = await Job.findById(jobId).select('status').lean();
+    if (cancelledByRequest || !latestBeforeSpawn || latestBeforeSpawn.status === 'cancelled') {
+      await cleanupPartialFiles(jobId);
+      await clearJobProgressCache(jobId).catch(() => {});
+      return;
+    }
+    if (cancelledForRetry) {
+      return;
+    }
+    if (pausedByRequest || latestBeforeSpawn.status === 'paused') {
+      await persistPausedState();
+      return;
+    }
+
     await publishProgress(
-      { status: 'downloading', progress: 0, downloadSpeed: null, eta: null },
+      { status: 'downloading', progress: maxProgress, downloadSpeed: null, eta: null },
       true
     );
 
-    const outputTemplate = path.join(DOWNLOADS_DIR, `${jobId}.%(ext)s`);
+    await fs.promises.mkdir(TMP_DOWNLOADS_DIR, { recursive: true });
+    const outputTemplate = path.join(TMP_DOWNLOADS_DIR, `${jobId}.%(ext)s`);
     let finalContainer = job.container;
 
     const executeDownload = async (targetContainer) => {
@@ -371,8 +498,18 @@ async function processJob(bullJob) {
         cookiePath,
       });
 
-      await runYtDlpDownload({
+      return runYtDlpDownload({
         args,
+        onController: (controller) => {
+          activeDownloadController = controller;
+          if (cancelledByRequest) {
+            controller.stop('cancelled');
+          } else if (cancelledForRetry) {
+            controller.stop('retry');
+          } else if (pausedByRequest) {
+            controller.stop('paused');
+          }
+        },
         onProgress: ({ percentage, downloadSpeed, eta }) => {
           const scaled = Math.min(94, Math.floor(percentage * 0.94));
           void publishProgress({
@@ -395,6 +532,18 @@ async function processJob(bullJob) {
     try {
       await executeDownload(finalContainer);
     } catch (downloadErr) {
+      if (cancelledByRequest) {
+        await cleanupPartialFiles(jobId);
+        await clearJobProgressCache(jobId).catch(() => {});
+        return;
+      }
+      if (pausedByRequest || cancelledForRetry) {
+        if (pausedByRequest && !cancelledForRetry) {
+          await persistPausedState();
+        }
+        return;
+      }
+
       const shouldFallbackToMkv =
         job.mode === 'video' &&
         finalContainer !== 'mkv' &&
@@ -410,11 +559,33 @@ async function processJob(bullJob) {
       await cleanupPartialFiles(jobId);
       finalContainer = 'mkv';
       reachedMuxingPhase = false;
+      maxProgress = 0;
+      lastDbProgress = 0;
       await publishProgress(
         { status: 'downloading', progress: 0, downloadSpeed: null, eta: null },
         true
       );
       await executeDownload('mkv');
+    }
+
+    if (cancelledByRequest) {
+      await cleanupPartialFiles(jobId);
+      await clearJobProgressCache(jobId).catch(() => {});
+      return;
+    }
+    if (cancelledForRetry) {
+      return;
+    }
+
+    const postRunDoc = await Job.findById(jobId).select('status').lean();
+    if (pausedByRequest || postRunDoc?.status === 'paused') {
+      await persistPausedState();
+      return;
+    }
+    if (!postRunDoc || postRunDoc.status === 'cancelled') {
+      await cleanupPartialFiles(jobId);
+      await clearJobProgressCache(jobId).catch(() => {});
+      return;
     }
 
     const outputPath = await findJobOutputFile(jobId, finalContainer);
@@ -427,30 +598,62 @@ async function processJob(bullJob) {
       finalContainer = detectedExt;
     }
 
-    const stats = await fs.promises.stat(outputPath);
-    const fileName = sanitizeFilename(job.title, finalContainer);
-    const expiresAt = new Date(Date.now() + DOWNLOAD_TTL_MS);
+    let targetDir = DOWNLOADS_DIR;
+    if (job.batchId) {
+      const batch = await Batch.findOne({ batchId: job.batchId })
+        .select('playlistTitle')
+        .lean();
+      if (batch && batch.playlistTitle) {
+        targetDir = path.join(DOWNLOADS_DIR, sanitizeFolderName(batch.playlistTitle));
+      }
+    }
 
-    await Job.findByIdAndUpdate(jobId, {
+    const desiredFileName = sanitizeFilename(job.title, finalContainer);
+    const moved = await moveToUniquePath(outputPath, targetDir, desiredFileName);
+    const stats = await fs.promises.stat(moved.filePath);
+    const expiresAt = DOWNLOAD_TTL_MS > 0 ? new Date(Date.now() + DOWNLOAD_TTL_MS) : null;
+
+    const updatedDoc = await Job.findByIdAndUpdate(jobId, {
       status: 'ready',
       progress: 100,
       downloadSpeed: null,
       eta: '00:00',
       container: finalContainer,
-      filePath: outputPath,
-      fileName,
+      filePath: moved.filePath,
+      fileName: moved.fileName,
       fileSizeBytes: stats.size,
       errorMessage: null,
       expiresAt,
     });
 
+    if (!updatedDoc || cancelledByRequest) {
+      await unlinkIfSafe(moved.filePath);
+      await cleanupPartialFiles(jobId);
+      await clearJobProgressCache(jobId).catch(() => {});
+      return;
+    }
+
     await clearJobProgressCache(jobId).catch(() => {});
     await updateBatchRollup(job.batchId);
     console.log(`Job ${jobId} ready (${finalContainer}, ${stats.size} bytes)`);
   } catch (err) {
-    await cleanupPartialFiles(jobId);
+    if (cancelledByRequest) {
+      await cleanupPartialFiles(jobId);
+      await clearJobProgressCache(jobId).catch(() => {});
+      return;
+    }
+    if (cancelledForRetry) {
+      return;
+    }
+    if (pausedByRequest) {
+      await persistPausedState();
+      return;
+    }
+
+    // Preserve `.part` files in `.mediavault-tmp` so clicking Retry resumes via `--continue`.
     await Job.findByIdAndUpdate(jobId, {
       status: 'failed',
+      progress: maxProgress,
       downloadSpeed: null,
       eta: null,
       errorMessage: err.message || 'Download job failed.',
@@ -460,6 +663,7 @@ async function processJob(bullJob) {
     console.error(`Job ${jobId} failed:`, err.message);
     throw err;
   } finally {
+    activeJobControllers.delete(jobId);
     if (cookieHandle) {
       await cookieHandle.cleanup();
     }
@@ -468,7 +672,47 @@ async function processJob(bullJob) {
 
 async function start() {
   await fs.promises.mkdir(DOWNLOADS_DIR, { recursive: true });
+  await fs.promises.mkdir(TMP_DOWNLOADS_DIR, { recursive: true });
   await connectDB();
+
+  const recoveryResult = await Job.updateMany(
+    { status: { $in: ['downloading', 'muxing'] } },
+    {
+      status: 'failed',
+      downloadSpeed: null,
+      eta: null,
+      errorMessage: 'Connection interrupted or worker restarted — click Retry to resume.',
+    }
+  );
+  if (recoveryResult.modifiedCount > 0) {
+    console.log(`Recovered ${recoveryResult.modifiedCount} interrupted job(s) for retry.`);
+  }
+
+  controlSubscriber = createRedisConnection();
+  controlSubscriber.on('message', (channel, rawMessage) => {
+    if (channel !== JOB_CONTROL_CHANNEL) return;
+    try {
+      const payload = JSON.parse(rawMessage);
+      if (payload.action === 'pause' && payload.jobId) {
+        activeJobControllers.get(String(payload.jobId))?.pause();
+      } else if (payload.action === 'pause-many' && Array.isArray(payload.jobIds)) {
+        for (const id of payload.jobIds) {
+          activeJobControllers.get(String(id))?.pause();
+        }
+      } else if (payload.action === 'cancel-for-retry' && payload.jobId) {
+        activeJobControllers.get(String(payload.jobId))?.cancelForRetry();
+      } else if (payload.action === 'cancel' && payload.jobId) {
+        activeJobControllers.get(String(payload.jobId))?.cancel();
+      } else if (payload.action === 'cancel-many' && Array.isArray(payload.jobIds)) {
+        for (const id of payload.jobIds) {
+          activeJobControllers.get(String(id))?.cancel();
+        }
+      }
+    } catch {
+      // Ignore malformed control payload
+    }
+  });
+  await controlSubscriber.subscribe(JOB_CONTROL_CHANNEL);
 
   workerConnection = createRedisConnection();
   workerInstance = new Worker(MEDIA_QUEUE_NAME, processJob, {
@@ -507,6 +751,10 @@ async function shutdown(signal) {
     if (workerInstance) {
       await workerInstance.close();
       workerInstance = null;
+    }
+    if (controlSubscriber) {
+      await controlSubscriber.quit();
+      controlSubscriber = null;
     }
     if (workerConnection) {
       await workerConnection.quit();

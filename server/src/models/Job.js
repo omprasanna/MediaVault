@@ -56,7 +56,7 @@ const jobSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['queued', 'downloading', 'muxing', 'ready', 'failed', 'expired', 'cancelled'],
+      enum: ['queued', 'downloading', 'muxing', 'paused', 'ready', 'failed', 'expired', 'cancelled'],
       default: 'queued',
       index: true,
     },

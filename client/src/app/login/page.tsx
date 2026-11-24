@@ -12,8 +12,8 @@ import {
   Lock,
   Mail,
   ShieldCheck,
-  Terminal,
 } from 'lucide-react';
+import { MediaVaultLogo } from '@/components/MediaVaultLogo';
 import { ThemeToggle } from '@/components/ThemeToggle';
 
 type AuthMode = 'login' | 'register';
@@ -192,7 +192,7 @@ function LoginFormContent() {
       {/* Minimal Top Security Bar */}
       <header className="z-10 flex w-full items-center justify-between px-4 pt-5 sm:px-6 sm:pt-6">
         <div className="flex items-center gap-2">
-          <Lock className="h-4 w-4 text-accent-text" aria-hidden="true" />
+          <MediaVaultLogo size={24} className="shrink-0" />
           <span className="text-sm font-semibold uppercase tracking-tight text-ink-primary">
             MediaVault
           </span>
@@ -238,9 +238,7 @@ function LoginFormContent() {
             <div className="mb-5 flex flex-col gap-3">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                  <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-border-subtle bg-surface-highest text-accent-text">
-                    <Terminal className="h-4 w-4" aria-hidden="true" />
-                  </div>
+                  <MediaVaultLogo size={32} className="shrink-0" />
                   <span className="text-sm font-semibold tracking-tight text-ink-primary">
                     MEDIAVAULT
                   </span>

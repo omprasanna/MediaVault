@@ -1,17 +1,19 @@
 'use client';
 
 import type { ReactNode } from 'react';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
+import useSWR, { useSWRConfig } from 'swr';
 import {
   Download,
   Layers,
-  Lock,
   LogOut,
   SlidersHorizontal,
   User,
 } from 'lucide-react';
+import { clearAllSwrCaches, SwrHttpError, swrJsonFetcher } from '@/lib/swrStore';
+import { MediaVaultLogo } from './MediaVaultLogo';
 import { ThemeToggle } from './ThemeToggle';
 
 interface AuthUser {
@@ -40,82 +42,85 @@ const ACTIVE_STATUSES = new Set(['queued', 'downloading', 'muxing']);
 export function AppShell({ children }: AppShellProps) {
   const pathname = usePathname();
   const router = useRouter();
+  const { cache, mutate } = useSWRConfig();
   const isLoginRoute = pathname === '/login';
 
-  const [user, setUser] = useState<AuthUser | null>(null);
-  const [nodeStatus, setNodeStatus] = useState<'checking' | 'online' | 'offline'>('checking');
-  const [activeJobCount, setActiveJobCount] = useState<number>(0);
   const [signingOut, setSigningOut] = useState<boolean>(false);
+  const [liveActiveCount, setLiveActiveCount] = useState<number | null>(null);
+
+  const { data: meData, error: meError } = useSWR<{ user?: AuthUser }>(
+    isLoginRoute ? null : '/api/auth/me',
+    swrJsonFetcher,
+    { revalidateOnFocus: true, shouldRetryOnError: false }
+  );
+
+  const {
+    data: healthData,
+    error: healthError,
+    isLoading: healthLoading,
+  } = useSWR<{ status?: string }>(
+    isLoginRoute ? null : '/api/health',
+    swrJsonFetcher,
+    { revalidateOnFocus: true, shouldRetryOnError: false }
+  );
+
+  const { data: jobsSummaryData } = useSWR<{
+    counts?: { active?: number };
+    jobs?: JobSummary[];
+  }>(isLoginRoute ? null : '/api/jobs?limit=1', swrJsonFetcher, {
+    revalidateOnFocus: true,
+  });
+
+  useEffect(() => {
+    if (
+      !isLoginRoute &&
+      meError instanceof SwrHttpError &&
+      meError.status === 401
+    ) {
+      void clearAllSwrCaches(cache, mutate).finally(() => {
+        router.replace('/login?expired=1');
+      });
+    }
+  }, [cache, isLoginRoute, meError, mutate, router]);
+
+  const fetchedActiveCount = useMemo(() => {
+    if (!jobsSummaryData) {
+      return 0;
+    }
+    if (typeof jobsSummaryData.counts?.active === 'number') {
+      return jobsSummaryData.counts.active;
+    }
+    if (Array.isArray(jobsSummaryData.jobs)) {
+      return jobsSummaryData.jobs.filter((job) =>
+        ACTIVE_STATUSES.has(job.status)
+      ).length;
+    }
+    return 0;
+  }, [jobsSummaryData]);
+
+  useEffect(() => {
+    if (jobsSummaryData) {
+      setLiveActiveCount(fetchedActiveCount);
+    }
+  }, [fetchedActiveCount, jobsSummaryData]);
 
   useEffect(() => {
     if (isLoginRoute) {
       return;
     }
 
-    const controller = new AbortController();
-
-    async function loadShellContext() {
-      try {
-        const [meRes, healthRes, jobsRes] = await Promise.all([
-          fetch('/api/auth/me', { cache: 'no-store', signal: controller.signal }),
-          fetch('/api/health', { cache: 'no-store', signal: controller.signal }),
-          fetch('/api/jobs?limit=25', { cache: 'no-store', signal: controller.signal }),
-        ]);
-
-        if (controller.signal.aborted) {
-          return;
-        }
-
-        if (meRes.status === 401) {
-          router.replace('/login?expired=1');
-          return;
-        }
-
-        if (meRes.ok) {
-          const meData = (await meRes.json()) as { user?: AuthUser };
-          if (meData.user) {
-            setUser(meData.user);
-          }
-        }
-
-        if (healthRes.ok) {
-          const healthData = (await healthRes.json()) as { status?: string };
-          setNodeStatus(healthData.status === 'ok' ? 'online' : 'offline');
-        } else {
-          setNodeStatus('offline');
-        }
-
-        if (jobsRes.ok) {
-          const jobsData = (await jobsRes.json()) as { jobs?: JobSummary[] };
-          const count = Array.isArray(jobsData.jobs)
-            ? jobsData.jobs.filter((job) => ACTIVE_STATUSES.has(job.status)).length
-            : 0;
-          setActiveJobCount(count);
-        }
-      } catch (err) {
-        if (err instanceof Error && err.name === 'AbortError') {
-          return;
-        }
-        setNodeStatus('offline');
-      }
-    }
-
-    void loadShellContext();
-
     function handleJobsUpdated(event: Event) {
       const customEvent = event as CustomEvent<{ activeCount?: number }>;
       if (typeof customEvent.detail?.activeCount === 'number') {
-        setActiveJobCount(Math.max(0, customEvent.detail.activeCount));
+        setLiveActiveCount(Math.max(0, customEvent.detail.activeCount));
       }
     }
 
     window.addEventListener('mediavault:jobs-updated', handleJobsUpdated);
-
     return () => {
-      controller.abort();
       window.removeEventListener('mediavault:jobs-updated', handleJobsUpdated);
     };
-  }, [isLoginRoute, pathname, router]);
+  }, [isLoginRoute]);
 
   if (isLoginRoute) {
     return <>{children}</>;
@@ -133,12 +138,25 @@ export function AppShell({ children }: AppShellProps) {
         cache: 'no-store',
       });
     } finally {
-      setUser(null);
+      setLiveActiveCount(null);
+      await clearAllSwrCaches(cache, mutate);
       router.replace('/login');
       router.refresh();
       setSigningOut(false);
     }
   }
+
+  const user = meData?.user ?? null;
+  const activeJobCount = liveActiveCount ?? fetchedActiveCount;
+  const nodeStatus: 'checking' | 'online' | 'offline' = healthError
+    ? 'offline'
+    : healthData
+      ? healthData.status === 'ok'
+        ? 'online'
+        : 'offline'
+      : healthLoading
+        ? 'checking'
+        : 'offline';
 
   const userInitial = user?.email ? user.email.charAt(0).toUpperCase() : null;
   const dotClass =
@@ -155,9 +173,10 @@ export function AppShell({ children }: AppShellProps) {
         <div className="mx-auto flex h-full max-w-7xl items-center justify-between gap-4 px-6">
           {/* Brand Left */}
           <Link href="/" className="mv-focus flex items-center gap-2.5 rounded-lg py-1 pr-2">
-            <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-border-default bg-surface-elevated text-accent-text shadow-[var(--shadow-xs)]">
-              <Lock className="h-4 w-4" aria-hidden="true" />
-            </span>
+            <MediaVaultLogo
+              size={32}
+              className="shrink-0 rounded-lg shadow-[var(--shadow-xs)]"
+            />
             <span className="text-sm font-semibold tracking-tight text-ink-primary">
               MediaVault
             </span>
@@ -264,7 +283,7 @@ export function AppShell({ children }: AppShellProps) {
       <header className="pt-safe fixed inset-x-0 top-0 z-50 border-b border-border-subtle bg-canvas/90 backdrop-blur-xl md:hidden">
         <div className="flex h-12 items-center justify-between gap-2 px-4">
           <Link href="/" className="mv-focus flex items-center gap-1.5 rounded-lg py-0.5 pr-1">
-            <Lock className="h-4 w-4 text-accent-text" aria-hidden="true" />
+            <MediaVaultLogo size={24} className="shrink-0" />
             <span className="text-sm font-semibold tracking-tight text-ink-primary">
               MediaVault
             </span>

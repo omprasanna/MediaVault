@@ -13,6 +13,7 @@ import {
 } from 'react';
 import { useRouter } from 'next/navigation';
 import { useTheme } from 'next-themes';
+import useSWR, { useSWRConfig } from 'swr';
 import {
   AlertCircle,
   Camera,
@@ -40,6 +41,7 @@ import {
   type CookiePlatformStatus,
   type SystemStatusInfo,
 } from '@/lib/mediaTypes';
+import { clearAllSwrCaches, swrJsonFetcher } from '@/lib/swrStore';
 
 interface AuthUser {
   id: string;
@@ -70,6 +72,7 @@ const MAX_COOKIE_BYTES = 512 * 1024;
 
 export default function SettingsPage() {
   const router = useRouter();
+  const { cache, mutate } = useSWRConfig();
   const { theme, resolvedTheme, setTheme } = useTheme();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const toastPopoverRef = useRef<HTMLDivElement>(null);
@@ -79,12 +82,29 @@ export default function SettingsPage() {
 
   const dropzoneHeadingId = useId();
   const [mounted, setMounted] = useState<boolean>(false);
-  const [user, setUser] = useState<AuthUser | null>(null);
   const [signingOut, setSigningOut] = useState<boolean>(false);
 
-  const [cookies, setCookies] = useState<CookiePlatformStatus[]>([]);
-  const [cookiesLoading, setCookiesLoading] = useState<boolean>(true);
-  const [systemStatus, setSystemStatus] = useState<SystemStatusInfo | null>(null);
+  const { data: meData } = useSWR<{ user?: AuthUser }>(
+    '/api/auth/me',
+    swrJsonFetcher,
+    { revalidateOnFocus: false, shouldRetryOnError: false }
+  );
+  const {
+    data: cookiesData,
+    isLoading: cookiesSwrLoading,
+    mutate: mutateCookies,
+  } = useSWR<{ cookies?: CookiePlatformStatus[] }>('/api/cookies', swrJsonFetcher);
+  const { data: systemData, mutate: mutateSystem } = useSWR<{
+    system?: SystemStatusInfo;
+  }>('/api/system/status', swrJsonFetcher);
+
+  const user = meData?.user ?? null;
+  const cookies = useMemo(
+    () => (Array.isArray(cookiesData?.cookies) ? cookiesData.cookies : []),
+    [cookiesData]
+  );
+  const cookiesLoading = Boolean(!cookiesData && cookiesSwrLoading);
+  const systemStatus = systemData?.system ?? null;
 
   const [targetPlatform, setTargetPlatform] = useState<CookiePlatform>('youtube');
   const [dragActive, setDragActive] = useState<boolean>(false);
@@ -182,59 +202,9 @@ export default function SettingsPage() {
     };
   }, [dismissToast, toastFocused, toastState]);
 
-  const loadSettingsData = useCallback(async (signal?: AbortSignal) => {
-    try {
-      const [meRes, cookiesRes, systemRes] = await Promise.all([
-        fetch('/api/auth/me', { cache: 'no-store', signal }),
-        fetch('/api/cookies', { cache: 'no-store', signal }),
-        fetch('/api/system/status', { cache: 'no-store', signal }),
-      ]);
-
-      if (signal?.aborted) {
-        return;
-      }
-
-      if (meRes.ok) {
-        const meData = (await meRes.json()) as { user?: AuthUser };
-        if (meData.user) {
-          setUser(meData.user);
-        }
-      }
-
-      if (cookiesRes.ok) {
-        const cookiesData = (await cookiesRes.json()) as {
-          cookies?: CookiePlatformStatus[];
-        };
-        if (Array.isArray(cookiesData.cookies)) {
-          setCookies(cookiesData.cookies);
-        }
-      }
-
-      if (systemRes.ok) {
-        const systemData = (await systemRes.json()) as {
-          system?: SystemStatusInfo;
-        };
-        if (systemData.system) {
-          setSystemStatus(systemData.system);
-        }
-      }
-    } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        return;
-      }
-    } finally {
-      if (!signal?.aborted) {
-        setCookiesLoading(false);
-      }
-    }
-  }, []);
-
   useEffect(() => {
     setMounted(true);
-    const controller = new AbortController();
-    void loadSettingsData(controller.signal);
-    return () => controller.abort();
-  }, [loadSettingsData]);
+  }, []);
 
   const cookieMap = useMemo(() => {
     const map = new Map<CookiePlatform, CookiePlatformStatus>();
@@ -284,7 +254,7 @@ export default function SettingsPage() {
       }
 
       const data = (await res.json()) as { cookieCount?: number };
-      await loadSettingsData();
+      await Promise.all([mutateCookies(), mutateSystem()]);
       const label =
         ALL_COOKIE_PLATFORMS.find((p) => p.id === platform)?.label || platform;
       showToast(
@@ -360,7 +330,7 @@ export default function SettingsPage() {
         return;
       }
 
-      await loadSettingsData();
+      await Promise.all([mutateCookies(), mutateSystem()]);
       const label =
         ALL_COOKIE_PLATFORMS.find((p) => p.id === platform)?.label || platform;
       showToast(`Removed ${label} cookies.txt`, 'success');
@@ -381,6 +351,7 @@ export default function SettingsPage() {
     try {
       await fetch('/api/auth/logout', { method: 'POST', cache: 'no-store' });
     } finally {
+      await clearAllSwrCaches(cache, mutate);
       router.replace('/login');
       router.refresh();
       setSigningOut(false);
@@ -699,11 +670,17 @@ export default function SettingsPage() {
 
           <div className="flex flex-col gap-1">
             <span className="text-[11px] font-medium uppercase tracking-[0.02em] text-ink-muted">
-              Temp Storage usage
+              {systemStatus?.downloadTtlMinutes === 0
+                ? 'Downloads Storage'
+                : 'Temp Storage usage'}
             </span>
             <span className="font-mono text-xs font-medium tabular-nums text-ink-primary">
               {systemStatus
-                ? `${systemStatus.tempStorageBytes === 0 ? '0 B' : formatBytes(systemStatus.tempStorageBytes)} / Auto-purge ${systemStatus.downloadTtlMinutes}m`
+                ? `${systemStatus.tempStorageBytes === 0 ? '0 B' : formatBytes(systemStatus.tempStorageBytes)} / ${
+                    systemStatus.downloadTtlMinutes === 0
+                      ? 'Persistent (No TTL)'
+                      : `Auto-purge ${systemStatus.downloadTtlMinutes}m`
+                  }`
                 : 'Calculating...'}
             </span>
           </div>

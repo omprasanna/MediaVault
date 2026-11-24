@@ -5,6 +5,7 @@ const mongoose = require('mongoose');
 const path = require('path');
 const { promisify } = require('util');
 const Job = require('../models/Job');
+const { parseDownloadTtlMinutes } = require('../utils/workerHelpers');
 
 const execFileAsync = promisify(execFile);
 const router = express.Router();
@@ -31,23 +32,37 @@ function readToolVersionsOnce() {
   return cachedToolVersionsPromise;
 }
 
-async function computeTempDirectoryStats(downloadsDir) {
-  let tempStorageBytes = 0;
+async function sumDirectoryBytes(dirPath) {
+  let totalBytes = 0;
   try {
-    const entries = await fs.promises.readdir(downloadsDir, { withFileTypes: true });
-    const fileStats = await Promise.all(
-      entries
-        .filter((entry) => entry.isFile() && entry.name !== '.gitkeep')
-        .map((entry) => fs.promises.stat(path.join(downloadsDir, entry.name)).catch(() => null))
+    const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+    const sizes = await Promise.all(
+      entries.map(async (entry) => {
+        if (entry.name === '.gitkeep' || entry.name === '.mediavault-tmp') {
+          return 0;
+        }
+        const fullPath = path.join(dirPath, entry.name);
+        if (entry.isDirectory()) {
+          return sumDirectoryBytes(fullPath);
+        }
+        if (entry.isFile()) {
+          const st = await fs.promises.stat(fullPath).catch(() => null);
+          return st && Number.isFinite(st.size) ? st.size : 0;
+        }
+        return 0;
+      })
     );
-    for (const st of fileStats) {
-      if (st && Number.isFinite(st.size)) {
-        tempStorageBytes += st.size;
-      }
+    for (const size of sizes) {
+      totalBytes += size;
     }
   } catch {
-    tempStorageBytes = 0;
+    return 0;
   }
+  return totalBytes;
+}
+
+async function computeTempDirectoryStats(downloadsDir) {
+  const tempStorageBytes = await sumDirectoryBytes(downloadsDir);
 
   let tempDiskFreeBytes = 0;
   try {
@@ -88,7 +103,7 @@ router.get('/status', async (req, res, next) => {
         ffmpegInstalled: tools.ffmpegInstalled,
         tempStorageBytes: disk.tempStorageBytes,
         tempDiskFreeBytes: disk.tempDiskFreeBytes,
-        downloadTtlMinutes: Number(process.env.DOWNLOAD_TTL_MINUTES || 30),
+        downloadTtlMinutes: parseDownloadTtlMinutes(process.env.DOWNLOAD_TTL_MINUTES),
         workerConcurrency: Number(process.env.WORKER_CONCURRENCY || 2),
         allowRegistration:
           String(process.env.ALLOW_REGISTRATION || '').toLowerCase() === 'true',

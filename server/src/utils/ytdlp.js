@@ -277,6 +277,40 @@ function spawnYtDlp(args, { timeoutMs = 90000, maxStdoutBytes = 20 * 1024 * 1024
 }
 
 /**
+ * Builds yt-dlp inspection CLI arguments. In playlist mode, `--playlist-end` is omitted
+ * unless a positive `maxPlaylistItems` cap is configured (0 = unlimited).
+ *
+ * @param {{ playlistMode: boolean, maxPlaylistItems?: number, forceIpv4?: boolean, cookiePath?: string | null, url: string }} params
+ * @returns {string[]}
+ */
+function buildInspectArgs({
+  playlistMode,
+  maxPlaylistItems = 0,
+  forceIpv4 = true,
+  cookiePath = null,
+  url,
+}) {
+  const args = playlistMode
+    ? ['--flat-playlist', '--dump-single-json', '--no-warnings']
+    : ['--no-playlist', '--dump-single-json', '--no-warnings'];
+
+  if (playlistMode && Number.isFinite(maxPlaylistItems) && maxPlaylistItems > 0) {
+    args.push('--playlist-end', String(Math.floor(maxPlaylistItems)));
+  }
+
+  if (forceIpv4) {
+    args.push('--force-ipv4');
+  }
+
+  if (cookiePath) {
+    args.push('--cookies', cookiePath);
+  }
+
+  args.push('--', url);
+  return args;
+}
+
+/**
  * Inspects a media URL via yt-dlp JSON dump after strict domain allowlisting and SSRF checks.
  *
  * @param {string} rawUrl
@@ -291,31 +325,27 @@ async function inspectMediaUrl(rawUrl, { useCookies = false, includePlaylist = f
       ? isPlaylistOnlyUrl(validated.parsedUrl) || validated.parsedUrl.searchParams.has('list')
       : isPlaylistOnlyUrl(validated.parsedUrl);
 
-  const maxPlaylistItems = Math.max(1, Number(process.env.MAX_PLAYLIST_ITEMS || 100));
-  const args = playlistMode
-    ? [
-        '--flat-playlist',
-        '--dump-single-json',
-        '--no-warnings',
-        '--playlist-end',
-        String(maxPlaylistItems),
-      ]
-    : ['--no-playlist', '--dump-single-json', '--no-warnings'];
-
-  if (process.env.YTDLP_FORCE_IPV4 !== 'false') {
-    args.push('--force-ipv4');
-  }
+  const rawMax = Number(process.env.MAX_PLAYLIST_ITEMS || 0);
+  const maxPlaylistItems = Number.isFinite(rawMax) && rawMax > 0 ? Math.floor(rawMax) : 0;
 
   let cookieHandle = null;
   try {
     if (useCookies === true) {
       cookieHandle = await prepareCookieArg(validated.platform);
-      args.push('--cookies', cookieHandle.cookiePath);
     }
 
-    args.push('--', validated.url);
+    const args = buildInspectArgs({
+      playlistMode,
+      maxPlaylistItems,
+      forceIpv4: process.env.YTDLP_FORCE_IPV4 !== 'false',
+      cookiePath: cookieHandle ? cookieHandle.cookiePath : null,
+      url: validated.url,
+    });
 
-    const { stdout } = await spawnYtDlp(args);
+    const { stdout } = await spawnYtDlp(args, {
+      timeoutMs: playlistMode ? 180000 : 90000,
+      maxStdoutBytes: playlistMode ? 64 * 1024 * 1024 : 20 * 1024 * 1024,
+    });
 
     let rawData;
     try {
@@ -348,5 +378,6 @@ module.exports = {
   resolveCookieFile,
   prepareCookieArg,
   spawnYtDlp,
+  buildInspectArgs,
   inspectMediaUrl,
 };

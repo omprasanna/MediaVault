@@ -326,3 +326,19 @@ progress.mv-progress:indeterminate {
     transform: none;
   }
 }
+
+dialog.mv-dialog {
+  margin: auto;
+  padding: 0;
+}
+
+dialog.mv-dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog.mv-dialog::backdrop {
+  background-color: rgba(9, 9, 11, 0.55);
+  backdrop-filter: blur(2px);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}

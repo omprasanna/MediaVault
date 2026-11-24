@@ -13,7 +13,6 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import {
-  MAX_BATCH_ITEMS,
   PLAYLIST_FORMAT_PRESETS,
   extractApiError,
   formatDuration,
@@ -25,25 +24,38 @@ import {
 interface PlaylistPickerProps {
   playlist: PlaylistInspectResult;
   useCookies: boolean;
+  presetId?: string | null;
+  onPresetChange?: (presetId: string) => void;
+  selectedIds?: string[] | null;
+  onSelectedIdsChange?: (ids: string[]) => void;
   onBatchQueued: (jobIds: string[], batchId: string | null) => void;
 }
 
-const INITIAL_VISIBLE_COUNT = 20;
+const INITIAL_VISIBLE_COUNT = 50;
+const VISIBLE_STEP = 100;
 
 export function PlaylistPicker({
   playlist,
   useCookies,
+  presetId: controlledPresetId,
+  onPresetChange,
+  selectedIds: controlledSelectedIds,
+  onSelectedIdsChange,
   onBatchQueued,
 }: PlaylistPickerProps) {
+  const defaultPresetId = /music\.youtube\.com/i.test(playlist.playlistUrl)
+    ? 'mp3-320'
+    : 'mp4-1080';
+  const isPresetControlled = onPresetChange !== undefined;
+  const isSelectionControlled = onSelectedIdsChange !== undefined;
+
   const formatSelectId = useId();
   const [failedThumbIds, setFailedThumbIds] = useState<Set<string>>(() => new Set());
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(
-    () => new Set(playlist.items.slice(0, MAX_BATCH_ITEMS).map((item) => item.id))
+  const [localSelectedIds, setLocalSelectedIds] = useState<Set<string>>(
+    () => new Set(playlist.items.map((item) => item.id))
   );
-  const [presetId, setPresetId] = useState<string>(() =>
-    /music\.youtube\.com/i.test(playlist.playlistUrl) ? 'mp3-320' : 'mp4-1080'
-  );
-  const [showAll, setShowAll] = useState<boolean>(false);
+  const [localPresetId, setLocalPresetId] = useState<string>(defaultPresetId);
+  const [visibleCount, setVisibleCount] = useState<number>(INITIAL_VISIBLE_COUNT);
   const [queuing, setQueuing] = useState<boolean>(false);
   const [queueError, setQueueError] = useState<string | null>(null);
   const [queueSuccess, setQueueSuccess] = useState<{
@@ -52,22 +64,54 @@ export function PlaylistPicker({
   } | null>(null);
 
   useEffect(() => {
-    setSelectedIds(
-      new Set(playlist.items.slice(0, MAX_BATCH_ITEMS).map((item) => item.id))
-    );
-    setPresetId(/music\.youtube\.com/i.test(playlist.playlistUrl) ? 'mp3-320' : 'mp4-1080');
-    setShowAll(false);
+    if (!isSelectionControlled) {
+      setLocalSelectedIds(new Set(playlist.items.map((item) => item.id)));
+    }
+    if (!isPresetControlled) {
+      setLocalPresetId(
+        /music\.youtube\.com/i.test(playlist.playlistUrl) ? 'mp3-320' : 'mp4-1080'
+      );
+    }
+    setVisibleCount(INITIAL_VISIBLE_COUNT);
     setFailedThumbIds(new Set());
     setQueueError(null);
     setQueueSuccess(null);
-  }, [playlist]);
+  }, [isPresetControlled, isSelectionControlled, playlist]);
+
+  const rawPresetId = isPresetControlled
+    ? controlledPresetId || defaultPresetId
+    : localPresetId;
 
   const activePreset = useMemo(
     () =>
-      PLAYLIST_FORMAT_PRESETS.find((preset) => preset.id === presetId) ||
+      PLAYLIST_FORMAT_PRESETS.find((preset) => preset.id === rawPresetId) ||
+      PLAYLIST_FORMAT_PRESETS.find((preset) => preset.id === defaultPresetId) ||
       PLAYLIST_FORMAT_PRESETS[0],
-    [presetId]
+    [defaultPresetId, rawPresetId]
   );
+
+  const effectivePresetId = activePreset.id;
+
+  const selectedIdsSet = useMemo(
+    () =>
+      isSelectionControlled
+        ? new Set(controlledSelectedIds ?? playlist.items.map((item) => item.id))
+        : localSelectedIds,
+    [controlledSelectedIds, isSelectionControlled, localSelectedIds, playlist.items]
+  );
+
+  const groupedPresets = useMemo(() => {
+    const groups = new Map<string, Array<(typeof PLAYLIST_FORMAT_PRESETS)[number]>>();
+    for (const preset of PLAYLIST_FORMAT_PRESETS) {
+      const bucket = groups.get(preset.group);
+      if (bucket) {
+        bucket.push(preset);
+      } else {
+        groups.set(preset.group, [preset]);
+      }
+    }
+    return Array.from(groups.entries());
+  }, []);
 
   const totalDurationSeconds = useMemo(
     () => playlist.items.reduce((sum, item) => sum + (Number(item.duration) || 0), 0),
@@ -75,66 +119,54 @@ export function PlaylistPicker({
   );
 
   const selectedItems = useMemo(
-    () => playlist.items.filter((item) => selectedIds.has(item.id)),
-    [playlist.items, selectedIds]
+    () => playlist.items.filter((item) => selectedIdsSet.has(item.id)),
+    [playlist.items, selectedIdsSet]
   );
 
   const selectedCount = selectedItems.length;
-  const exceedsBatchCap = selectedCount > MAX_BATCH_ITEMS;
-  const visibleItems = showAll
-    ? playlist.items
-    : playlist.items.slice(0, INITIAL_VISIBLE_COUNT);
+  const visibleItems = playlist.items.slice(0, visibleCount);
   const hiddenCount = Math.max(0, playlist.items.length - visibleItems.length);
 
-  function handleSelectAll() {
+  function updateSelection(next: Set<string>) {
     setQueueSuccess(null);
     setQueueError(null);
-    setSelectedIds(new Set(playlist.items.map((item) => item.id)));
+    if (onSelectedIdsChange) {
+      onSelectedIdsChange(Array.from(next));
+    } else {
+      setLocalSelectedIds(next);
+    }
+  }
+
+  function handleSelectAll() {
+    updateSelection(new Set(playlist.items.map((item) => item.id)));
   }
 
   function handleDeselectAll() {
-    setQueueSuccess(null);
-    setQueueError(null);
-    setSelectedIds(new Set());
+    updateSelection(new Set());
   }
 
   function handleInvertSelection() {
-    setQueueSuccess(null);
-    setQueueError(null);
-    setSelectedIds((prev) => {
-      const next = new Set<string>();
-      for (const item of playlist.items) {
-        if (!prev.has(item.id)) {
-          next.add(item.id);
-        }
+    const next = new Set<string>();
+    for (const item of playlist.items) {
+      if (!selectedIdsSet.has(item.id)) {
+        next.add(item.id);
       }
-      return next;
-    });
-  }
-
-  function handleKeepFirstFifty() {
-    setSelectedIds(
-      new Set(selectedItems.slice(0, MAX_BATCH_ITEMS).map((item) => item.id))
-    );
-    setQueueError(null);
+    }
+    updateSelection(next);
   }
 
   function handleToggleItem(itemId: string) {
-    setQueueSuccess(null);
-    setQueueError(null);
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(itemId)) {
-        next.delete(itemId);
-      } else {
-        next.add(itemId);
-      }
-      return next;
-    });
+    const next = new Set(selectedIdsSet);
+    if (next.has(itemId)) {
+      next.delete(itemId);
+    } else {
+      next.add(itemId);
+    }
+    updateSelection(next);
   }
 
   async function handleQueueBatch() {
-    if (queuing || selectedCount === 0 || exceedsBatchCap) {
+    if (queuing || selectedCount === 0) {
       return;
     }
 
@@ -255,44 +287,44 @@ export function PlaylistPicker({
               </label>
               <select
                 id={formatSelectId}
-                value={presetId}
+                name="playlistFormat"
+                value={effectivePresetId}
                 onChange={(e) => {
-                  setPresetId(e.target.value);
+                  const nextId = e.target.value;
+                  if (onPresetChange) {
+                    onPresetChange(nextId);
+                  } else {
+                    setLocalPresetId(nextId);
+                  }
                   setQueueSuccess(null);
                   setQueueError(null);
                 }}
                 data-testid="playlist-format-select"
                 className="mv-focus h-9 cursor-pointer rounded-lg border border-border-default bg-surface-recessed px-3 font-mono text-xs text-ink-primary transition-colors hover:border-border-strong"
               >
-                {PLAYLIST_FORMAT_PRESETS.map((preset) => (
-                  <option key={preset.id} value={preset.id}>
-                    {preset.label}
-                  </option>
+                {groupedPresets.map(([group, presets]) => (
+                  <optgroup
+                    key={group}
+                    label={group}
+                    className="bg-surface-recessed text-ink-secondary"
+                  >
+                    {presets.map((preset) => (
+                      <option
+                        key={preset.id}
+                        value={preset.id}
+                        className="bg-surface-recessed text-ink-primary"
+                      >
+                        {preset.label}
+                      </option>
+                    ))}
+                  </optgroup>
                 ))}
               </select>
             </div>
           </div>
         </section>
 
-        {/* Batch Warnings / Status Feedback */}
-        {exceedsBatchCap && (
-          <div
-            role="alert"
-            className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-muxing-border bg-muxing-bg px-4 py-2.5 text-xs text-muxing"
-          >
-            <span>
-              Maximum {MAX_BATCH_ITEMS} items allowed per batch ({selectedCount} currently selected).
-            </span>
-            <button
-              type="button"
-              onClick={handleKeepFirstFifty}
-              className="mv-focus cursor-pointer rounded-md border border-muxing-border bg-surface-elevated px-2.5 py-1 font-mono text-[11px] font-semibold text-ink-primary hover:bg-surface-high"
-            >
-              Keep first {MAX_BATCH_ITEMS}
-            </button>
-          </div>
-        )}
-
+        {/* Batch Status Feedback */}
         {queueError && (
           <div
             role="alert"
@@ -351,7 +383,7 @@ export function PlaylistPicker({
           ) : (
             <div className="divide-y divide-border-subtle">
               {visibleItems.map((item, idx) => {
-                const isChecked = selectedIds.has(item.id);
+                const isChecked = selectedIdsSet.has(item.id);
                 const thumbFailed = failedThumbIds.has(item.id);
 
                 return (
@@ -424,14 +456,27 @@ export function PlaylistPicker({
 
           {/* Expand More Footer */}
           {hiddenCount > 0 && (
-            <button
-              type="button"
-              onClick={() => setShowAll(true)}
-              className="mv-focus flex w-full cursor-pointer items-center justify-center gap-1.5 border-t border-border-subtle bg-surface-recessed py-2.5 font-mono text-xs text-ink-secondary transition-colors hover:bg-surface-high hover:text-ink-primary"
-            >
-              <ChevronDown className="h-4 w-4" aria-hidden="true" />
-              <span className="tabular-nums">Show +{hiddenCount} more playlist tracks</span>
-            </button>
+            <div className="flex flex-wrap items-center justify-center gap-4 border-t border-border-subtle bg-surface-recessed px-3 py-2.5">
+              <button
+                type="button"
+                onClick={() => setVisibleCount((prev) => prev + VISIBLE_STEP)}
+                className="mv-focus inline-flex cursor-pointer items-center gap-1.5 font-mono text-xs text-ink-secondary transition-colors hover:text-ink-primary"
+              >
+                <ChevronDown className="h-4 w-4" aria-hidden="true" />
+                <span className="tabular-nums">
+                  Show +{Math.min(VISIBLE_STEP, hiddenCount)} more playlist tracks
+                </span>
+              </button>
+              {hiddenCount > VISIBLE_STEP && (
+                <button
+                  type="button"
+                  onClick={() => setVisibleCount(playlist.items.length)}
+                  className="mv-focus cursor-pointer font-mono text-xs text-accent-text hover:underline"
+                >
+                  Show all ({hiddenCount} remaining)
+                </button>
+              )}
+            </div>
           )}
         </section>
 
@@ -439,9 +484,9 @@ export function PlaylistPicker({
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border-default bg-surface-recessed px-3.5 py-2.5 font-mono text-[11px] text-ink-muted">
           <span className="inline-flex items-center gap-1.5">
             <ShieldCheck className="h-3.5 w-3.5 text-ready" aria-hidden="true" />
-            <span>Stream-copy video capped ≤ 1080p · Max {MAX_BATCH_ITEMS} items / batch</span>
+            <span>Stream-copy video capped ≤ 1080p · Full playlist batching</span>
           </span>
-          <span>Worker concurrency: 2 · TTL: 30m</span>
+          <span>Worker concurrency: 2 · Saved directly to Downloads</span>
         </div>
       </div>
 
@@ -468,7 +513,7 @@ export function PlaylistPicker({
 
           <button
             type="button"
-            disabled={queuing || selectedCount === 0 || exceedsBatchCap}
+            disabled={queuing || selectedCount === 0}
             onClick={handleQueueBatch}
             data-testid="queue-batch-btn"
             className="mv-focus inline-flex h-11 w-full cursor-pointer items-center justify-center gap-2 rounded-lg bg-accent px-4 text-[13px] font-semibold text-on-accent shadow-[var(--shadow-xs)] transition-colors hover:bg-accent-hover active:bg-accent-active disabled:cursor-not-allowed disabled:opacity-50 sm:h-9 sm:w-auto sm:shrink-0"

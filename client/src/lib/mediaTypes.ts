@@ -5,6 +5,7 @@ export type JobStatus =
   | 'queued'
   | 'downloading'
   | 'muxing'
+  | 'paused'
   | 'ready'
   | 'failed'
   | 'expired'
@@ -85,6 +86,23 @@ export interface JobDetail extends JobSummary {
   errorMessage: string | null;
 }
 
+export interface JobCounts {
+  all: number;
+  active: number;
+  paused: number;
+  ready: number;
+  failed: number;
+  history: number;
+}
+
+export interface JobsPagination {
+  total: number;
+  page: number;
+  limit: number;
+  pages: number;
+  hasMore: boolean;
+}
+
 export type CookiePlatform = 'youtube' | 'instagram' | 'facebook' | 'x' | 'dailymotion';
 
 export interface CookiePlatformStatus {
@@ -119,12 +137,11 @@ export interface PlaylistFormatPreset {
   id: string;
   label: string;
   shortBadge: string;
+  group: string;
   mode: MediaMode;
   container: MediaContainer;
   formatSelector: string;
 }
-
-export const MAX_BATCH_ITEMS = 50;
 
 export const SUPPORTED_PLATFORMS = [
   { id: 'youtube', label: 'YouTube', shortLabel: 'YT' },
@@ -137,16 +154,9 @@ export const SUPPORTED_PLATFORMS = [
 
 export const PLAYLIST_FORMAT_PRESETS: readonly PlaylistFormatPreset[] = [
   {
-    id: 'mp3-320',
-    label: 'Audio · MP3 (320 kbps)',
-    shortBadge: '320k MP3',
-    mode: 'audio',
-    container: 'mp3',
-    formatSelector: 'bestaudio/best',
-  },
-  {
     id: 'mp4-1080',
-    label: 'Video · Best MP4 ≤ 1080p (H.264)',
+    group: 'Video · MP4 (H.264)',
+    label: 'MP4 · 1080p Full HD (H.264)',
     shortBadge: '1080p MP4',
     mode: 'video',
     container: 'mp4',
@@ -154,21 +164,100 @@ export const PLAYLIST_FORMAT_PRESETS: readonly PlaylistFormatPreset[] = [
       'bestvideo[height<=1080][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=1080][ext=mp4]/bestvideo[height<=1080]+bestaudio/best[height<=1080]',
   },
   {
+    id: 'mp4-720',
+    group: 'Video · MP4 (H.264)',
+    label: 'MP4 · 720p HD (H.264)',
+    shortBadge: '720p MP4',
+    mode: 'video',
+    container: 'mp4',
+    formatSelector:
+      'bestvideo[height<=720][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=720][ext=mp4]/bestvideo[height<=720]+bestaudio/best[height<=720]',
+  },
+  {
+    id: 'mp4-480',
+    group: 'Video · MP4 (H.264)',
+    label: 'MP4 · 480p SD (H.264)',
+    shortBadge: '480p MP4',
+    mode: 'video',
+    container: 'mp4',
+    formatSelector:
+      'bestvideo[height<=480][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=480][ext=mp4]/bestvideo[height<=480]+bestaudio/best[height<=480]',
+  },
+  {
+    id: 'mp4-360',
+    group: 'Video · MP4 (H.264)',
+    label: 'MP4 · 360p Data Saver (H.264)',
+    shortBadge: '360p MP4',
+    mode: 'video',
+    container: 'mp4',
+    formatSelector:
+      'bestvideo[height<=360][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=360][ext=mp4]/bestvideo[height<=360]+bestaudio/best[height<=360]',
+  },
+  {
     id: 'webm-1080',
-    label: 'Video · Best WebM ≤ 1080p (VP9)',
+    group: 'Video · WebM (VP9)',
+    label: 'WebM · 1080p Full HD (VP9)',
     shortBadge: '1080p WebM',
     mode: 'video',
     container: 'webm',
     formatSelector:
-      'bestvideo[height<=1080][vcodec^=vp9]+bestaudio[acodec^=opus]/bestvideo[height<=1080]+bestaudio/best[height<=1080]',
+      'bestvideo[height<=1080][vcodec^=vp09]+bestaudio[acodec^=opus]/bestvideo[height<=1080][vcodec^=vp9]+bestaudio[acodec^=opus]/bestvideo[height<=1080]+bestaudio/best[height<=1080]',
+  },
+  {
+    id: 'webm-720',
+    group: 'Video · WebM (VP9)',
+    label: 'WebM · 720p HD (VP9)',
+    shortBadge: '720p WebM',
+    mode: 'video',
+    container: 'webm',
+    formatSelector:
+      'bestvideo[height<=720][vcodec^=vp09]+bestaudio[acodec^=opus]/bestvideo[height<=720][vcodec^=vp9]+bestaudio[acodec^=opus]/bestvideo[height<=720]+bestaudio/best[height<=720]',
+  },
+  {
+    id: 'webm-480',
+    group: 'Video · WebM (VP9)',
+    label: 'WebM · 480p SD (VP9)',
+    shortBadge: '480p WebM',
+    mode: 'video',
+    container: 'webm',
+    formatSelector:
+      'bestvideo[height<=480][vcodec^=vp09]+bestaudio[acodec^=opus]/bestvideo[height<=480][vcodec^=vp9]+bestaudio[acodec^=opus]/bestvideo[height<=480]+bestaudio/best[height<=480]',
   },
   {
     id: 'mkv-1080',
-    label: 'Video · Best MKV ≤ 1080p (Stream-Copy)',
+    group: 'Video · MKV (Stream-Copy)',
+    label: 'MKV · 1080p Full HD (Stream-Copy)',
     shortBadge: '1080p MKV',
     mode: 'video',
     container: 'mkv',
     formatSelector: 'bestvideo[height<=1080]+bestaudio/best[height<=1080]',
+  },
+  {
+    id: 'mkv-720',
+    group: 'Video · MKV (Stream-Copy)',
+    label: 'MKV · 720p HD (Stream-Copy)',
+    shortBadge: '720p MKV',
+    mode: 'video',
+    container: 'mkv',
+    formatSelector: 'bestvideo[height<=720]+bestaudio/best[height<=720]',
+  },
+  {
+    id: 'mkv-480',
+    group: 'Video · MKV (Stream-Copy)',
+    label: 'MKV · 480p SD (Stream-Copy)',
+    shortBadge: '480p MKV',
+    mode: 'video',
+    container: 'mkv',
+    formatSelector: 'bestvideo[height<=480]+bestaudio/best[height<=480]',
+  },
+  {
+    id: 'mp3-320',
+    group: 'Audio Only',
+    label: 'Audio · MP3 (320 kbps)',
+    shortBadge: '320k MP3',
+    mode: 'audio',
+    container: 'mp3',
+    formatSelector: 'bestaudio/best',
   },
 ] as const;
 
@@ -288,9 +377,9 @@ export function formatExpiryCountdown(
   expiresAt: string | null | undefined,
   nowMs: number
 ): string {
-  if (!expiresAt) return 'TTL active';
+  if (!expiresAt) return 'Saved in Downloads';
   const targetMs = Date.parse(expiresAt);
-  if (!Number.isFinite(targetMs)) return 'TTL active';
+  if (!Number.isFinite(targetMs)) return 'Saved in Downloads';
 
   const remainingSeconds = Math.floor((targetMs - nowMs) / 1000);
   if (remainingSeconds <= 0) return 'Expired';

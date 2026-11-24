@@ -1,104 +1,117 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
+import useSWR from 'swr';
 import { ArrowRight, CheckCircle2, Download, X } from 'lucide-react';
 import {
   ACTIVE_JOB_STATUSES,
   type JobDetail,
   type JobSummary,
 } from '@/lib/mediaTypes';
+import { swrJsonFetcher } from '@/lib/swrStore';
 
 interface DockedActiveJobBarProps {
   refreshTrigger: number;
   trackedJobIds: string[];
 }
 
+interface DockedJobsResponse {
+  counts?: { active?: number };
+  jobs?: JobSummary[];
+}
+
+const DOCKED_JOBS_KEY = '/api/jobs?limit=10&prioritizeActive=true';
+
 export function DockedActiveJobBar({
   refreshTrigger,
   trackedJobIds,
 }: DockedActiveJobBarProps) {
-  const [activeJobs, setActiveJobs] = useState<JobSummary[]>([]);
-  const [primaryDetail, setPrimaryDetail] = useState<JobDetail | null>(null);
-  const [readyJob, setReadyJob] = useState<JobSummary | null>(null);
   const [dismissedReadyId, setDismissedReadyId] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    let pollTimer: ReturnType<typeof setTimeout> | null = null;
-
-    async function pollJobs() {
-      try {
-        const listRes = await fetch('/api/jobs?limit=20', { cache: 'no-store' });
-        if (!listRes.ok || cancelled) {
-          return;
-        }
-
-        const listData = (await listRes.json()) as { jobs?: JobSummary[] };
-        const allJobs = Array.isArray(listData.jobs) ? listData.jobs : [];
-        const active = allJobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status));
-
-        setActiveJobs(active);
-
-        window.dispatchEvent(
-          new CustomEvent('mediavault:jobs-updated', {
-            detail: { activeCount: active.length },
-          })
-        );
-
-        if (active.length > 0) {
-          const priorityJob =
-            active.find((job) => job.status === 'downloading' || job.status === 'muxing') ||
-            active[0];
-
-          try {
-            const detailRes = await fetch(
-              `/api/jobs/${encodeURIComponent(priorityJob.id)}`,
-              { cache: 'no-store' }
-            );
-            if (detailRes.ok && !cancelled) {
-              const detailData = (await detailRes.json()) as JobDetail;
-              setPrimaryDetail(detailData);
-            }
-          } catch {
-            // Keep list summary fallback on transient detail polling failure
-          }
-
-          setReadyJob(null);
-          if (!cancelled) {
-            pollTimer = setTimeout(pollJobs, 2500);
-          }
-          return;
-        }
-
-        setPrimaryDetail(null);
-
-        if (trackedJobIds.length > 0) {
-          const trackedSet = new Set(trackedJobIds);
-          const finishedReady = allJobs.find(
-            (job) =>
-              trackedSet.has(job.id) &&
-              job.status === 'ready' &&
-              job.id !== dismissedReadyId
-          );
-          setReadyJob(finishedReady || null);
-        }
-      } catch {
-        if (!cancelled) {
-          pollTimer = setTimeout(pollJobs, 5000);
-        }
-      }
+  const { data: listData, mutate: mutateList } = useSWR<DockedJobsResponse>(
+    DOCKED_JOBS_KEY,
+    swrJsonFetcher,
+    {
+      refreshInterval: (latest) => {
+        const jobs = Array.isArray(latest?.jobs) ? latest.jobs : [];
+        const activeCount =
+          typeof latest?.counts?.active === 'number'
+            ? latest.counts.active
+            : jobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status)).length;
+        return activeCount > 0 ? 2500 : 0;
+      },
+      refreshWhenHidden: false,
+      revalidateOnFocus: true,
+      keepPreviousData: true,
     }
+  );
 
-    void pollJobs();
-
-    return () => {
-      cancelled = true;
-      if (pollTimer) {
-        clearTimeout(pollTimer);
-      }
+  const { allJobs, activeJobs, totalActiveCount } = useMemo(() => {
+    const jobs = Array.isArray(listData?.jobs) ? listData.jobs : [];
+    const active = jobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status));
+    const activeTotal =
+      typeof listData?.counts?.active === 'number'
+        ? listData.counts.active
+        : active.length;
+    return {
+      allJobs: jobs,
+      activeJobs: active,
+      totalActiveCount: activeTotal,
     };
-  }, [refreshTrigger, trackedJobIds, dismissedReadyId]);
+  }, [listData]);
+
+  const priorityJob = useMemo(() => {
+    if (activeJobs.length === 0) {
+      return null;
+    }
+    return (
+      activeJobs.find(
+        (job) => job.status === 'downloading' || job.status === 'muxing'
+      ) || activeJobs[0]
+    );
+  }, [activeJobs]);
+
+  const detailKey = priorityJob
+    ? `/api/jobs/${encodeURIComponent(priorityJob.id)}`
+    : null;
+
+  const { data: primaryDetail } = useSWR<JobDetail>(detailKey, swrJsonFetcher, {
+    refreshInterval: priorityJob ? 2500 : 0,
+    refreshWhenHidden: false,
+  });
+
+  useEffect(() => {
+    if (refreshTrigger > 0) {
+      void mutateList();
+    }
+  }, [mutateList, refreshTrigger]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !listData) {
+      return;
+    }
+    window.dispatchEvent(
+      new CustomEvent('mediavault:jobs-updated', {
+        detail: { activeCount: totalActiveCount },
+      })
+    );
+  }, [listData, totalActiveCount]);
+
+  const readyJob = useMemo(() => {
+    if (activeJobs.length > 0 || trackedJobIds.length === 0) {
+      return null;
+    }
+    const trackedSet = new Set(trackedJobIds);
+    return (
+      allJobs.find(
+        (job) =>
+          trackedSet.has(job.id) &&
+          job.status === 'ready' &&
+          job.id !== dismissedReadyId
+      ) || null
+    );
+  }, [activeJobs.length, allJobs, dismissedReadyId, trackedJobIds]);
 
   if (activeJobs.length === 0 && !readyJob) {
     return null;
@@ -219,7 +232,7 @@ export function DockedActiveJobBar({
           className="inline-flex items-center gap-1 whitespace-nowrap font-mono text-xs font-medium tabular-nums text-accent-text hover:underline"
         >
           <span>
-            View Queue ({activeJobs.length})
+            View Queue ({totalActiveCount || activeJobs.length})
           </span>
           <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
         </Link>
