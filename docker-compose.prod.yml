@@ -1,0 +1,32 @@
+services:
+  mongo:
+    restart: unless-stopped
+
+  redis:
+    restart: unless-stopped
+
+  api:
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-false}
+
+  worker:
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+      target: prod
+    image: mediavault-client:prod
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      WATCHPACK_POLLING: "false"
+    volumes: !reset []
+
+  cloudflared:
+    restart: unless-stopped

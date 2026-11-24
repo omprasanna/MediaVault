@@ -1,0 +1,362 @@
+'use client';
+
+import type { ReactNode } from 'react';
+import { useEffect, useState } from 'react';
+import Link from 'next/link';
+import { usePathname, useRouter } from 'next/navigation';
+import {
+  Download,
+  Layers,
+  Lock,
+  LogOut,
+  SlidersHorizontal,
+  User,
+} from 'lucide-react';
+import { ThemeToggle } from './ThemeToggle';
+
+interface AuthUser {
+  id: string;
+  email: string;
+  role: string;
+}
+
+interface JobSummary {
+  id: string;
+  status: string;
+}
+
+interface AppShellProps {
+  children: ReactNode;
+}
+
+const NAV_ITEMS = [
+  { href: '/', desktopLabel: 'Downloader', mobileLabel: 'Downloader', icon: Download },
+  { href: '/queue', desktopLabel: 'Queue & History', mobileLabel: 'Queue', icon: Layers },
+  { href: '/settings', desktopLabel: 'Settings', mobileLabel: 'Settings', icon: SlidersHorizontal },
+] as const;
+
+const ACTIVE_STATUSES = new Set(['queued', 'downloading', 'muxing']);
+
+export function AppShell({ children }: AppShellProps) {
+  const pathname = usePathname();
+  const router = useRouter();
+  const isLoginRoute = pathname === '/login';
+
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [nodeStatus, setNodeStatus] = useState<'checking' | 'online' | 'offline'>('checking');
+  const [activeJobCount, setActiveJobCount] = useState<number>(0);
+  const [signingOut, setSigningOut] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (isLoginRoute) {
+      return;
+    }
+
+    const controller = new AbortController();
+
+    async function loadShellContext() {
+      try {
+        const [meRes, healthRes, jobsRes] = await Promise.all([
+          fetch('/api/auth/me', { cache: 'no-store', signal: controller.signal }),
+          fetch('/api/health', { cache: 'no-store', signal: controller.signal }),
+          fetch('/api/jobs?limit=25', { cache: 'no-store', signal: controller.signal }),
+        ]);
+
+        if (controller.signal.aborted) {
+          return;
+        }
+
+        if (meRes.status === 401) {
+          router.replace('/login?expired=1');
+          return;
+        }
+
+        if (meRes.ok) {
+          const meData = (await meRes.json()) as { user?: AuthUser };
+          if (meData.user) {
+            setUser(meData.user);
+          }
+        }
+
+        if (healthRes.ok) {
+          const healthData = (await healthRes.json()) as { status?: string };
+          setNodeStatus(healthData.status === 'ok' ? 'online' : 'offline');
+        } else {
+          setNodeStatus('offline');
+        }
+
+        if (jobsRes.ok) {
+          const jobsData = (await jobsRes.json()) as { jobs?: JobSummary[] };
+          const count = Array.isArray(jobsData.jobs)
+            ? jobsData.jobs.filter((job) => ACTIVE_STATUSES.has(job.status)).length
+            : 0;
+          setActiveJobCount(count);
+        }
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') {
+          return;
+        }
+        setNodeStatus('offline');
+      }
+    }
+
+    void loadShellContext();
+
+    function handleJobsUpdated(event: Event) {
+      const customEvent = event as CustomEvent<{ activeCount?: number }>;
+      if (typeof customEvent.detail?.activeCount === 'number') {
+        setActiveJobCount(Math.max(0, customEvent.detail.activeCount));
+      }
+    }
+
+    window.addEventListener('mediavault:jobs-updated', handleJobsUpdated);
+
+    return () => {
+      controller.abort();
+      window.removeEventListener('mediavault:jobs-updated', handleJobsUpdated);
+    };
+  }, [isLoginRoute, pathname, router]);
+
+  if (isLoginRoute) {
+    return <>{children}</>;
+  }
+
+  async function handleLogout() {
+    if (signingOut) {
+      return;
+    }
+
+    setSigningOut(true);
+    try {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        cache: 'no-store',
+      });
+    } finally {
+      setUser(null);
+      router.replace('/login');
+      router.refresh();
+      setSigningOut(false);
+    }
+  }
+
+  const userInitial = user?.email ? user.email.charAt(0).toUpperCase() : null;
+  const dotClass =
+    nodeStatus === 'online'
+      ? 'bg-ready-dot'
+      : nodeStatus === 'offline'
+        ? 'bg-failed-dot'
+        : 'bg-muxing-dot';
+
+  return (
+    <div className="flex min-h-screen flex-col bg-canvas text-ink-primary">
+      {/* Desktop Sticky Top Bar (>= 768px) */}
+      <header className="fixed inset-x-0 top-0 z-50 hidden h-14 border-b border-border-subtle bg-canvas/85 backdrop-blur-md md:block">
+        <div className="mx-auto flex h-full max-w-7xl items-center justify-between gap-4 px-6">
+          {/* Brand Left */}
+          <Link href="/" className="mv-focus flex items-center gap-2.5 rounded-lg py-1 pr-2">
+            <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-border-default bg-surface-elevated text-accent-text shadow-[var(--shadow-xs)]">
+              <Lock className="h-4 w-4" aria-hidden="true" />
+            </span>
+            <span className="text-sm font-semibold tracking-tight text-ink-primary">
+              MediaVault
+            </span>
+            <span className="rounded border border-border-default bg-surface px-1.5 py-0.5 font-mono text-[11px] font-medium leading-none text-ink-muted">
+              v2.4.0
+            </span>
+          </Link>
+
+          {/* Center Pill Navigation */}
+          <nav
+            aria-label="Primary"
+            className="flex items-center gap-1 rounded-full border border-border-default bg-surface-recessed p-1"
+          >
+            {NAV_ITEMS.map((item) => {
+              const isActive =
+                item.href === '/' ? pathname === '/' : pathname.startsWith(item.href);
+
+              return (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  aria-current={isActive ? 'page' : undefined}
+                  className={`mv-focus inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[13px] transition-colors ${
+                    isActive
+                      ? 'border-border-default bg-surface-elevated font-semibold text-ink-primary shadow-[var(--shadow-xs)]'
+                      : 'border-transparent font-medium text-ink-secondary hover:bg-surface-elevated/60 hover:text-ink-primary'
+                  }`}
+                >
+                  <span>{item.desktopLabel}</span>
+                  {item.href === '/queue' && (
+                    <span
+                      className="rounded-full border border-accent-border bg-accent-soft px-1.5 py-0.5 font-mono text-[10px] font-semibold leading-none tabular-nums text-accent-text"
+                      aria-label={`${activeJobCount} active jobs`}
+                    >
+                      {activeJobCount}
+                    </span>
+                  )}
+                </Link>
+              );
+            })}
+          </nav>
+
+          {/* Right Status & Session Controls */}
+          <div className="flex items-center gap-2">
+            <div
+              className="flex items-center gap-2 rounded-full border border-border-default bg-surface-elevated px-3 py-1 shadow-[var(--shadow-xs)]"
+              title="MediaVault Daemon Status"
+            >
+              <span className="relative flex h-2 w-2">
+                {nodeStatus === 'online' && (
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-ready-dot opacity-75" />
+                )}
+                <span className={`relative inline-flex h-2 w-2 rounded-full ${dotClass}`} />
+              </span>
+              <span className="font-mono text-[11px] text-ink-muted">
+                Local Node{' '}
+                <span
+                  className={`hidden font-medium lg:inline ${
+                    nodeStatus === 'online'
+                      ? 'text-ready'
+                      : nodeStatus === 'offline'
+                        ? 'text-failed'
+                        : 'text-muxing'
+                  }`}
+                >
+                  (
+                  {nodeStatus === 'online'
+                    ? 'Online · 127.0.0.1'
+                    : nodeStatus === 'offline'
+                      ? 'Offline'
+                      : 'Checking'}
+                  )
+                </span>
+              </span>
+            </div>
+
+            <ThemeToggle />
+
+            <button
+              type="button"
+              onClick={handleLogout}
+              disabled={signingOut}
+              aria-label="Sign out"
+              title="Sign out"
+              data-testid="desktop-logout-button"
+              className="mv-focus inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-border-default bg-surface-elevated text-ink-secondary shadow-[var(--shadow-xs)] transition-colors hover:border-failed-border hover:bg-failed-bg hover:text-failed disabled:opacity-50"
+            >
+              <LogOut className="h-4 w-4" aria-hidden="true" />
+            </button>
+
+            <Link
+              href="/settings"
+              aria-label={user ? `Account settings for ${user.email}` : 'Account settings'}
+              title={user?.email || 'Account settings'}
+              className="mv-focus inline-flex h-8 w-8 items-center justify-center rounded-full border border-border-default bg-surface-high font-mono text-xs font-semibold text-ink-primary shadow-[var(--shadow-xs)] transition-colors hover:border-border-strong"
+            >
+              {userInitial ?? <User className="h-4 w-4" aria-hidden="true" />}
+            </Link>
+          </div>
+        </div>
+      </header>
+
+      {/* Mobile Compact Header (< 768px) */}
+      <header className="pt-safe fixed inset-x-0 top-0 z-50 border-b border-border-subtle bg-canvas/90 backdrop-blur-xl md:hidden">
+        <div className="flex h-12 items-center justify-between gap-2 px-4">
+          <Link href="/" className="mv-focus flex items-center gap-1.5 rounded-lg py-0.5 pr-1">
+            <Lock className="h-4 w-4 text-accent-text" aria-hidden="true" />
+            <span className="text-sm font-semibold tracking-tight text-ink-primary">
+              MediaVault
+            </span>
+            <span className="rounded bg-surface-highest px-1.5 py-0.5 font-mono text-[10px] font-medium uppercase leading-none text-ink-secondary">
+              v2.4.0
+            </span>
+          </Link>
+
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5 rounded-full border border-border-subtle bg-surface px-2 py-1">
+              <span className={`h-1.5 w-1.5 rounded-full ${dotClass}`} />
+              <span className="font-mono text-[11px] text-ready">Local Node</span>
+            </div>
+
+            <ThemeToggle className="rounded-full" />
+
+            <Link
+              href="/settings"
+              aria-label={user ? `Account settings for ${user.email}` : 'Account settings'}
+              className="mv-focus inline-flex h-8 w-8 items-center justify-center rounded-full bg-accent font-mono text-xs font-semibold text-on-accent"
+            >
+              {userInitial ?? <User className="h-4 w-4" aria-hidden="true" />}
+            </Link>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content Workspace */}
+      <main className="w-full flex-1 pt-12 pb-20 md:pt-14 md:pb-8">{children}</main>
+
+      {/* Desktop Utility Footer */}
+      <footer className="hidden w-full border-t border-border-subtle bg-surface-recessed py-4 md:block">
+        <div className="mx-auto flex max-w-4xl items-center justify-between gap-4 px-6 font-mono text-[11px] text-ink-muted">
+          <span>MediaVault Daemon · Local Storage Sandbox · Stream-Copy Engine</span>
+          <div className="flex items-center gap-4">
+            <Link href="/" className="transition-colors hover:text-ink-primary">
+              Downloader
+            </Link>
+            <Link href="/queue" className="transition-colors hover:text-ink-primary">
+              Queue
+            </Link>
+            <Link href="/settings" className="transition-colors hover:text-ink-primary">
+              Settings
+            </Link>
+          </div>
+        </div>
+      </footer>
+
+      {/* Mobile Fixed Bottom Tab Bar (< 768px) */}
+      <nav
+        aria-label="Mobile Primary"
+        className="pb-safe fixed inset-x-0 bottom-0 z-50 border-t border-border-subtle bg-canvas/95 backdrop-blur-xl md:hidden"
+      >
+        <div className="grid h-14 grid-cols-3 items-center px-1">
+          {NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            const isActive =
+              item.href === '/' ? pathname === '/' : pathname.startsWith(item.href);
+
+            return (
+              <Link
+                key={item.href}
+                href={item.href}
+                aria-current={isActive ? 'page' : undefined}
+                className={`mv-focus relative flex min-h-[44px] min-w-[64px] flex-col items-center justify-center rounded-lg transition-colors ${
+                  isActive
+                    ? 'font-semibold text-accent-text'
+                    : 'font-medium text-ink-secondary hover:text-ink-primary'
+                }`}
+              >
+                <div className="relative">
+                  <Icon className="h-5 w-5" aria-hidden="true" />
+                  {item.href === '/queue' && activeJobCount > 0 && (
+                    <span className="absolute -top-1 -right-2.5 rounded-full bg-accent px-1 py-0.5 font-mono text-[10px] font-semibold leading-none tabular-nums text-on-accent">
+                      {activeJobCount}
+                    </span>
+                  )}
+                </div>
+                <span className="mt-0.5 text-[11px] leading-[14px] tracking-[0.02em]">
+                  {item.mobileLabel}
+                </span>
+                {isActive && (
+                  <span
+                    aria-hidden="true"
+                    className="absolute bottom-0.5 h-0.5 w-6 rounded-full bg-accent"
+                  />
+                )}
+              </Link>
+            );
+          })}
+        </div>
+      </nav>
+    </div>
+  );
+}
