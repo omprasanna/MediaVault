@@ -30,22 +30,22 @@ MediaVault runs inside a dedicated Docker network (`mediavault-net`) composed of
 
    Paste the generated 64-character hex value into `JWT_SECRET=` in `.env` (or use `openssl rand -hex 32`).
 
-2. Start the stack:
+2. Start the stack (use **only one** deployment mode at a time — `docker-compose.hub.yml` already runs `api` + `worker` + `client` together on port `3000`, so do not run `docker-compose.yml -f docker-compose.prod.yml` alongside it):
 
    - **Single-image Docker Hub deployment (Recommended for self-hosters — no build required):**
      Runs the unified Alpine image [`omprasannasahoo181/mediavault:latest`](https://hub.docker.com/r/omprasannasahoo181/mediavault) (`api` + `worker` + Next.js `client` in one container) alongside MongoDB and Redis via [docker-compose.hub.yml](./docker-compose.hub.yml):
      ```powershell
      docker compose -f docker-compose.hub.yml pull
-     docker compose -f docker-compose.hub.yml up -d
+     docker compose -f docker-compose.hub.yml up -d --remove-orphans
      ```
      *(If using Cloudflare Tunnel with `docker-compose.hub.yml`, point your tunnel's Public Hostname service URL to `http://mediavault:3000`.)*
    - **Local development** (with source hot reload):
      ```powershell
-     docker compose up -d --build
+     docker compose up -d --build --remove-orphans
      ```
    - **Daily source-built production mode** (Next.js `standalone` build + `unless-stopped` restarts):
      ```powershell
-     docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+     docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build --remove-orphans
      ```
 
 3. Open `http://localhost:3000`.

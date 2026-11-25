@@ -4,6 +4,8 @@ services:
     restart: unless-stopped
     volumes:
       - mongo_data:/data/db
+    networks:
+      - mediavault-net
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')", "--quiet"]
       interval: 10s
@@ -17,6 +19,8 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
+    networks:
+      - mediavault-net
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -28,6 +32,9 @@ services:
     restart: unless-stopped
     ports:
       - "${CLIENT_PORT:-3000}:3000"
+    env_file:
+      - path: .env
+        required: false
     environment:
       NODE_ENV: production
       APP_ROLE: all
@@ -49,8 +56,10 @@ services:
       MAX_BATCH_ITEMS: ${MAX_BATCH_ITEMS:-0}
       MIN_FREE_DISK_BYTES: ${MIN_FREE_DISK_BYTES:-2147483648}
     volumes:
-      - ${HOST_DOWNLOADS_DIR:-./downloads}:/data/downloads
-      - ${HOST_COOKIES_DIR:-./cookies}:/data/cookies
+      - ${HOST_DOWNLOADS_DIR:-./data/downloads}:/data/downloads
+      - ${HOST_COOKIES_DIR:-./data/cookies}:/data/cookies
+    networks:
+      - mediavault-net
     depends_on:
       mongo:
         condition: service_healthy
@@ -63,11 +72,20 @@ services:
       - tunnel
     restart: unless-stopped
     command: ["tunnel", "--no-autoupdate", "run"]
+    env_file:
+      - path: .env
+        required: false
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    networks:
+      - mediavault-net
     depends_on:
       mediavault:
         condition: service_healthy
+
+networks:
+  mediavault-net:
+    driver: bridge
 
 volumes:
   mongo_data:
