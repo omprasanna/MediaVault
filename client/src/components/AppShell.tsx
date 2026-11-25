@@ -6,11 +6,17 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import useSWR, { useSWRConfig } from 'swr';
 import {
+  Check,
+  Copy,
   Download,
+  Globe,
   Layers,
+  LoaderCircle,
   LogOut,
   SlidersHorizontal,
+  Square,
   User,
+  X,
 } from 'lucide-react';
 import { clearAllSwrCaches, SwrHttpError, swrJsonFetcher } from '@/lib/swrStore';
 import { MediaVaultLogo } from './MediaVaultLogo';
@@ -25,6 +31,11 @@ interface AuthUser {
 interface JobSummary {
   id: string;
   status: string;
+}
+
+interface RemoteTunnel {
+  status: 'offline' | 'starting' | 'online';
+  url: string | null;
 }
 
 interface AppShellProps {
@@ -47,6 +58,14 @@ export function AppShell({ children }: AppShellProps) {
 
   const [signingOut, setSigningOut] = useState<boolean>(false);
   const [liveActiveCount, setLiveActiveCount] = useState<number | null>(null);
+  const [remoteTunnel, setRemoteTunnel] = useState<RemoteTunnel>({
+    status: 'offline',
+    url: null,
+  });
+  const [remoteBusy, setRemoteBusy] = useState<boolean>(false);
+  const [remotePanelOpen, setRemotePanelOpen] = useState<boolean>(false);
+  const [remoteError, setRemoteError] = useState<string | null>(null);
+  const [remoteCopied, setRemoteCopied] = useState<boolean>(false);
 
   const { data: meData, error: meError } = useSWR<{ user?: AuthUser }>(
     isLoginRoute ? null : '/api/auth/me',
@@ -82,6 +101,31 @@ export function AppShell({ children }: AppShellProps) {
       });
     }
   }, [cache, isLoginRoute, meError, mutate, router]);
+
+  useEffect(() => {
+    if (isLoginRoute) return;
+
+    let cancelled = false;
+    fetch('/api/system/remote', { cache: 'no-store' })
+      .then(async (response) => {
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error?.message || 'Unable to check remote access.');
+        }
+        if (!cancelled) setRemoteTunnel(payload.tunnel);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setRemoteError(
+            error instanceof Error ? error.message : 'Unable to check remote access.'
+          );
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isLoginRoute]);
 
   const fetchedActiveCount = useMemo(() => {
     if (!jobsSummaryData) {
@@ -144,6 +188,145 @@ export function AppShell({ children }: AppShellProps) {
       router.refresh();
       setSigningOut(false);
     }
+  }
+
+  async function changeRemoteTunnel(method: 'POST' | 'DELETE') {
+    if (remoteBusy) return;
+    setRemoteBusy(true);
+    setRemoteError(null);
+    setRemoteCopied(false);
+    try {
+      const response = await fetch('/api/system/remote', {
+        method,
+        cache: 'no-store',
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error?.message || 'Unable to update remote access.');
+      }
+      setRemoteTunnel(payload.tunnel);
+    } catch (error) {
+      setRemoteError(
+        error instanceof Error ? error.message : 'Unable to update remote access.'
+      );
+    } finally {
+      setRemoteBusy(false);
+    }
+  }
+
+  function handleRemoteButtonClick() {
+    setRemotePanelOpen(true);
+    if (remoteTunnel.url || remoteBusy) return;
+    void changeRemoteTunnel('POST');
+  }
+
+  async function handleCopyRemoteUrl() {
+    if (!remoteTunnel.url) return;
+    try {
+      await navigator.clipboard.writeText(remoteTunnel.url);
+      setRemoteCopied(true);
+    } catch {
+      setRemoteError('Could not copy the URL. Copy it directly from the field.');
+    }
+  }
+
+  function renderRemoteControl(compact = false) {
+    return (
+      <div className="relative shrink-0">
+        <button
+          type="button"
+          onClick={handleRemoteButtonClick}
+          aria-expanded={remotePanelOpen}
+          aria-haspopup="dialog"
+          className={`mv-focus inline-flex h-8 cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-border-default bg-surface-elevated px-2.5 text-ink-secondary shadow-[var(--shadow-xs)] transition-colors hover:border-border-strong hover:text-ink-primary ${
+            compact ? 'text-xs' : 'text-[13px]'
+          }`}
+        >
+          {remoteBusy ? (
+            <LoaderCircle className="h-4 w-4 animate-spin" aria-hidden="true" />
+          ) : (
+            <Globe className="h-4 w-4" aria-hidden="true" />
+          )}
+          <span>Remote</span>
+        </button>
+
+        {remotePanelOpen && (
+          <section
+            role="dialog"
+            aria-label="Remote access"
+            className="absolute top-full right-0 z-[60] mt-2 w-[min(22rem,calc(100vw-2rem))] rounded-xl border border-border-default bg-surface-elevated p-4 text-ink-primary shadow-[var(--shadow-overlay)]"
+          >
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold">Remote access</h2>
+                <p className="mt-1 text-xs text-ink-muted">
+                  {remoteBusy
+                    ? 'Starting a temporary secure tunnel…'
+                    : remoteTunnel.url
+                      ? 'Your temporary link is ready.'
+                      : 'Start a temporary link to access MediaVault remotely.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setRemotePanelOpen(false)}
+                aria-label="Close remote access"
+                className="mv-focus rounded-md p-1 text-ink-muted transition-colors hover:bg-surface-high hover:text-ink-primary"
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+
+            {remoteTunnel.url && (
+              <div className="flex min-w-0 items-center gap-2 rounded-lg border border-border-default bg-surface-recessed p-2">
+                <a
+                  href={remoteTunnel.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="min-w-0 flex-1 truncate font-mono text-xs text-accent-text hover:underline"
+                >
+                  {remoteTunnel.url}
+                </a>
+                <button
+                  type="button"
+                  onClick={() => void handleCopyRemoteUrl()}
+                  className="mv-focus inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-border-default bg-surface-elevated px-2 text-xs font-medium text-ink-secondary transition-colors hover:text-ink-primary"
+                >
+                  {remoteCopied ? (
+                    <Check className="h-3.5 w-3.5 text-ready" aria-hidden="true" />
+                  ) : (
+                    <Copy className="h-3.5 w-3.5" aria-hidden="true" />
+                  )}
+                  {remoteCopied ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+            )}
+
+            {remoteError && (
+              <p role="alert" className="mt-3 text-xs text-failed">
+                {remoteError}
+              </p>
+            )}
+
+            {remoteTunnel.url && (
+              <button
+                type="button"
+                onClick={() => void changeRemoteTunnel('DELETE')}
+                disabled={remoteBusy}
+                className="mv-focus mt-3 inline-flex h-8 items-center gap-1.5 rounded-md border border-failed-border bg-failed-bg px-2.5 text-xs font-medium text-failed transition-colors hover:opacity-80 disabled:opacity-50"
+              >
+                {remoteBusy ? (
+                  <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <Square className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+                Stop tunnel
+              </button>
+            )}
+          </section>
+        )}
+      </div>
+    );
   }
 
   const user = meData?.user ?? null;
@@ -253,6 +436,7 @@ export function AppShell({ children }: AppShellProps) {
               </span>
             </div>
 
+            {renderRemoteControl()}
             <ThemeToggle />
 
             <button
@@ -298,6 +482,7 @@ export function AppShell({ children }: AppShellProps) {
               <span className="font-mono text-[11px] text-ready">Local Node</span>
             </div>
 
+            {renderRemoteControl(true)}
             <ThemeToggle className="rounded-full" />
 
             <Link

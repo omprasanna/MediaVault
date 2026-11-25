@@ -42,6 +42,8 @@ RUN apk add --no-cache python3 py3-pip gcc musl-dev libffi-dev python3-dev \
     && find /opt/ytdlp-venv -type d -name "__pycache__" -prune -exec rm -rf {} + \
     && find /opt/ytdlp-venv -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
 
+FROM cloudflare/cloudflared:latest AS cloudflared
+
 FROM alpine:3.24 AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
@@ -60,6 +62,7 @@ RUN apk add --no-cache nodejs python3 libffi libstdc++ libgcc ca-certificates ff
     && mkdir -p /data/downloads /data/cookies /app/server /app/client
 
 COPY --from=ytdlp-builder /opt/ytdlp-venv /opt/ytdlp-venv
+COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared
 COPY --from=server-deps /build/server/node_modules /app/server/node_modules
 COPY server/package.json /app/server/package.json
 COPY server/src /app/server/src

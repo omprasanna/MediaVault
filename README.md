@@ -75,6 +75,13 @@ You can expose MediaVault on an encrypted `https://` URL for your phone or remot
 
 ### Option A — Instant Temporary URL (`*.trycloudflare.com`, no account required)
 
+1. Make sure the MediaVault stack is running and open MediaVault in your browser.
+2. Select **Remote** in the top bar. MediaVault starts a temporary Cloudflare Quick Tunnel and displays its URL; use **Copy** to share it. Select **Stop tunnel** when remote access is no longer needed. The URL changes each time you restart the tunnel.
+
+The app image includes `cloudflared`. For HTTPS-only cookies, set `COOKIE_SECURE=true` in `.env` and recreate the app container before starting the tunnel.
+
+You can also start a Quick Tunnel manually:
+
 1. **Make sure the MediaVault stack is already running:**
    ```powershell
    docker compose up -d

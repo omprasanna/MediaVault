@@ -5,12 +5,38 @@ const mongoose = require('mongoose');
 const path = require('path');
 const { promisify } = require('util');
 const Job = require('../models/Job');
+const { remoteTunnel } = require('../utils/remoteTunnel');
 const { parseDownloadTtlMinutes } = require('../utils/workerHelpers');
+const { AppError } = require('../utils/errors');
 
 const execFileAsync = promisify(execFile);
 const router = express.Router();
 
 let cachedToolVersionsPromise = null;
+
+router.get('/remote', (_req, res) => {
+  return res.status(200).json({ tunnel: remoteTunnel.getStatus() });
+});
+
+router.post('/remote', async (_req, res, next) => {
+  try {
+    const tunnel = await remoteTunnel.start();
+    return res.status(200).json({ tunnel });
+  } catch (err) {
+    return next(
+      new AppError(503, 'REMOTE_TUNNEL_UNAVAILABLE', err.message)
+    );
+  }
+});
+
+router.delete('/remote', async (_req, res, next) => {
+  try {
+    const tunnel = await remoteTunnel.stop();
+    return res.status(200).json({ tunnel });
+  } catch (err) {
+    return next(err);
+  }
+});
 
 function readToolVersionsOnce() {
   if (cachedToolVersionsPromise) {

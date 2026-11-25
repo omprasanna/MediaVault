@@ -12,6 +12,7 @@ const inspectRouter = require('./routes/inspect');
 const jobsRouter = require('./routes/jobs');
 const proxyRouter = require('./routes/proxy');
 const systemRouter = require('./routes/system');
+const { remoteTunnel } = require('./utils/remoteTunnel');
 const { AppError, errorHandler } = require('./utils/errors');
 
 const app = express();
@@ -57,6 +58,7 @@ async function start() {
 async function shutdown(signal) {
   console.log(`Received ${signal}, shutting down API server...`);
   try {
+    await remoteTunnel.stop();
     if (server) {
       await new Promise((resolve) => server.close(resolve));
     }
