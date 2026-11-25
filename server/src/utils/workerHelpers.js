@@ -73,8 +73,9 @@ function enforce1080pSelector(selector, mode, container) {
  * - `--newline` progress output
  * - Stream-copy muxing (`-c copy`) for video containers or 320kbps MP3 extraction
  * - `--cookies` ONLY when `cookiePath` is explicitly provided
+ * - `--proxy` / `--geo-verification-proxy` when `proxyUrl` is provided
  *
- * @param {{ url: string, mode: 'video' | 'audio', container: 'mp4' | 'webm' | 'mkv' | 'mp3', formatSelector: string, outputTemplate: string, cookiePath?: string | null }} params
+ * @param {{ url: string, mode: 'video' | 'audio', container: 'mp4' | 'webm' | 'mkv' | 'mp3', formatSelector: string, outputTemplate: string, cookiePath?: string | null, proxyUrl?: string | null }} params
  * @returns {string[]}
  */
 function buildYtDlpJobArgs({
@@ -84,6 +85,7 @@ function buildYtDlpJobArgs({
   formatSelector,
   outputTemplate,
   cookiePath = null,
+  proxyUrl = null,
 }) {
   const safeSelector = enforce1080pSelector(formatSelector, mode, container);
   const args = [
@@ -128,6 +130,10 @@ function buildYtDlpJobArgs({
 
   if (cookiePath) {
     args.push('--cookies', cookiePath);
+  }
+
+  if (proxyUrl) {
+    args.push('--proxy', proxyUrl, '--geo-verification-proxy', proxyUrl);
   }
 
   args.push('-o', outputTemplate, '--', url);

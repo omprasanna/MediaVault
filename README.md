@@ -21,11 +21,14 @@ MediaVault runs inside a dedicated Docker network (`mediavault-net`) composed of
 
 ## Quick Start
 
-1. Create your local environment file from `.env.example` and replace `JWT_SECRET` with a strong random secret:
+1. Create your local environment file from `.env.example` and generate a cryptographically secure `JWT_SECRET`:
 
    ```powershell
    Copy-Item .env.example .env
+   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
    ```
+
+   Paste the generated 64-character hex value into `JWT_SECRET=` in `.env` (or use `openssl rand -hex 32`).
 
 2. Start the stack:
 

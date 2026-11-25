@@ -6,16 +6,20 @@ const { Worker } = require('bullmq');
 const { connectDB, disconnectDB } = require('./config/db');
 const Batch = require('./models/Batch');
 const Job = require('./models/Job');
+const mediaQueue = require('./queues/mediaQueue');
 const {
   JOB_CONTROL_CHANNEL,
   MEDIA_QUEUE_NAME,
-  clearJobProgressCache,
   createRedisConnection,
-  setJobProgressCache,
-} = require('./queues/mediaQueue');
+} = mediaQueue;
 const { AppError } = require('./utils/errors');
 const { sanitizeFilename } = require('./utils/formatMapper');
-const { assertPublicUrl } = require('./utils/ssrf');
+const { resolvePublicUrl } = require('./utils/ssrf');
+const {
+  buildProxyChildEnv,
+  createPinnedSsrfProxy,
+  redactProxyCredentials,
+} = require('./utils/ssrfProxy');
 const {
   assertSufficientDiskSpace,
   buildYtDlpJobArgs,
@@ -213,11 +217,18 @@ async function updateBatchRollup(batchId) {
   );
 }
 
-function runYtDlpDownload({ args, onProgress, onMuxing, onController }) {
+function runYtDlpDownload({
+  args,
+  env = process.env,
+  onProgress,
+  onMuxing,
+  onController,
+}) {
   return new Promise((resolve, reject) => {
     const child = spawn('yt-dlp', args, {
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
+      env,
     });
 
     let stdoutRemainder = '';
@@ -341,10 +352,10 @@ function runYtDlpDownload({ args, onProgress, onMuxing, onController }) {
           .map((l) => l.trim())
           .filter(Boolean);
         const errLine = [...lines].reverse().find((l) => /^ERROR:/i.test(l));
-        const message = errLine
+        const rawMessage = errLine
           ? errLine.replace(/^ERROR:\s*/i, '')
           : lines[lines.length - 1] || `yt-dlp exited with code ${code}`;
-        finish(new Error(message));
+        finish(new Error(redactProxyCredentials(rawMessage)));
         return;
       }
 
@@ -353,11 +364,16 @@ function runYtDlpDownload({ args, onProgress, onMuxing, onController }) {
   });
 }
 
-async function processJob(bullJob) {
+async function processJob(bullJob, deps) {
   const jobId = bullJob?.data?.jobId;
   if (!jobId) {
     return;
   }
+
+  const runtimeDeps = deps && typeof deps === 'object' ? deps : {};
+  const resolvePublicUrlFn = runtimeDeps.resolvePublicUrl || resolvePublicUrl;
+  const createPinnedSsrfProxyFn = runtimeDeps.createPinnedSsrfProxy || createPinnedSsrfProxy;
+  const runYtDlpDownloadFn = runtimeDeps.runYtDlpDownload || runYtDlpDownload;
 
   const job = await Job.findById(jobId);
   if (!job || ['cancelled', 'paused', 'ready'].includes(job.status)) {
@@ -407,7 +423,7 @@ async function processJob(bullJob) {
 
     if (forceDb || statusChanged || now - lastCacheWriteMs >= 400) {
       lastCacheWriteMs = now;
-      await setJobProgressCache(jobId, {
+      await mediaQueue.setJobProgressCache(jobId, {
         status: currentStatus,
         progress: maxProgress,
         downloadSpeed,
@@ -440,14 +456,17 @@ async function processJob(bullJob) {
       eta: null,
       errorMessage: null,
     }).catch(() => {});
-    await clearJobProgressCache(jobId).catch(() => {});
+    await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
   };
 
   let cookieHandle = null;
+  let ssrfProxy = null;
 
   try {
     const validated = validateMediaUrl(job.sourceUrl);
-    await assertPublicUrl(validated.url);
+    const resolved = await resolvePublicUrlFn(validated.url, {
+      lookup: runtimeDeps.lookup,
+    });
 
     try {
       await assertSufficientDiskSpace(DOWNLOADS_DIR);
@@ -468,7 +487,7 @@ async function processJob(bullJob) {
     const latestBeforeSpawn = await Job.findById(jobId).select('status').lean();
     if (cancelledByRequest || !latestBeforeSpawn || latestBeforeSpawn.status === 'cancelled') {
       await cleanupPartialFiles(jobId);
-      await clearJobProgressCache(jobId).catch(() => {});
+      await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
       return;
     }
     if (cancelledForRetry) {
@@ -488,6 +507,14 @@ async function processJob(bullJob) {
     const outputTemplate = path.join(TMP_DOWNLOADS_DIR, `${jobId}.%(ext)s`);
     let finalContainer = job.container;
 
+    const forceIpv4 = process.env.YTDLP_FORCE_IPV4 !== 'false';
+    ssrfProxy = await createPinnedSsrfProxyFn({
+      pinnedHosts: new Map([[resolved.hostname, resolved.addresses]]),
+      preferIpv4: forceIpv4,
+      lookup: runtimeDeps.lookup,
+    });
+    const proxyEnv = buildProxyChildEnv(ssrfProxy.proxyUrl);
+
     const executeDownload = async (targetContainer) => {
       const args = buildYtDlpJobArgs({
         url: validated.url,
@@ -496,10 +523,12 @@ async function processJob(bullJob) {
         formatSelector: job.formatSelector,
         outputTemplate,
         cookiePath,
+        proxyUrl: ssrfProxy.proxyUrl,
       });
 
-      return runYtDlpDownload({
+      return runYtDlpDownloadFn({
         args,
+        env: proxyEnv,
         onController: (controller) => {
           activeDownloadController = controller;
           if (cancelledByRequest) {
@@ -534,7 +563,7 @@ async function processJob(bullJob) {
     } catch (downloadErr) {
       if (cancelledByRequest) {
         await cleanupPartialFiles(jobId);
-        await clearJobProgressCache(jobId).catch(() => {});
+        await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
         return;
       }
       if (pausedByRequest || cancelledForRetry) {
@@ -542,6 +571,14 @@ async function processJob(bullJob) {
           await persistPausedState();
         }
         return;
+      }
+
+      if (ssrfProxy && ssrfProxy.getLastBlockedError()) {
+        throw new AppError(
+          400,
+          'INVALID_URL',
+          'Target URL or redirect resolved to a restricted IP address.'
+        );
       }
 
       const shouldFallbackToMkv =
@@ -570,7 +607,7 @@ async function processJob(bullJob) {
 
     if (cancelledByRequest) {
       await cleanupPartialFiles(jobId);
-      await clearJobProgressCache(jobId).catch(() => {});
+      await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
       return;
     }
     if (cancelledForRetry) {
@@ -584,7 +621,7 @@ async function processJob(bullJob) {
     }
     if (!postRunDoc || postRunDoc.status === 'cancelled') {
       await cleanupPartialFiles(jobId);
-      await clearJobProgressCache(jobId).catch(() => {});
+      await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
       return;
     }
 
@@ -629,17 +666,17 @@ async function processJob(bullJob) {
     if (!updatedDoc || cancelledByRequest) {
       await unlinkIfSafe(moved.filePath);
       await cleanupPartialFiles(jobId);
-      await clearJobProgressCache(jobId).catch(() => {});
+      await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
       return;
     }
 
-    await clearJobProgressCache(jobId).catch(() => {});
+    await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
     await updateBatchRollup(job.batchId);
     console.log(`Job ${jobId} ready (${finalContainer}, ${stats.size} bytes)`);
   } catch (err) {
     if (cancelledByRequest) {
       await cleanupPartialFiles(jobId);
-      await clearJobProgressCache(jobId).catch(() => {});
+      await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
       return;
     }
     if (cancelledForRetry) {
@@ -658,12 +695,15 @@ async function processJob(bullJob) {
       eta: null,
       errorMessage: err.message || 'Download job failed.',
     }).catch(() => {});
-    await clearJobProgressCache(jobId).catch(() => {});
+    await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
     await updateBatchRollup(job.batchId).catch(() => {});
     console.error(`Job ${jobId} failed:`, err.message);
     throw err;
   } finally {
     activeJobControllers.delete(jobId);
+    if (ssrfProxy) {
+      await ssrfProxy.close();
+    }
     if (cookieHandle) {
       await cookieHandle.cleanup();
     }
@@ -715,7 +755,7 @@ async function start() {
   await controlSubscriber.subscribe(JOB_CONTROL_CHANNEL);
 
   workerConnection = createRedisConnection();
-  workerInstance = new Worker(MEDIA_QUEUE_NAME, processJob, {
+  workerInstance = new Worker(MEDIA_QUEUE_NAME, (job) => processJob(job), {
     connection: workerConnection,
     concurrency: WORKER_CONCURRENCY,
   });
@@ -768,10 +808,17 @@ async function shutdown(signal) {
   }
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+if (require.main === module) {
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 
-start().catch((err) => {
-  console.error('Failed to start MediaVault Worker:', err);
-  process.exit(1);
-});
+  start().catch((err) => {
+    console.error('Failed to start MediaVault Worker:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  processJob,
+  runYtDlpDownload,
+};

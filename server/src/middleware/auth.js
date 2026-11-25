@@ -3,14 +3,90 @@ const User = require('../models/User');
 const { AppError } = require('../utils/errors');
 
 const DEFAULT_EXPIRES_MS = 7 * 24 * 60 * 60 * 1000;
+const MIN_JWT_SECRET_LENGTH = 32;
+const MIN_JWT_SECRET_UNIQUE_CHARS = 6;
+const JWT_SECRET_HELP =
+  'Generate a cryptographically secure secret (e.g. `node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"` or `openssl rand -hex 32`).';
+
+const KNOWN_WEAK_JWT_SECRETS = new Set([
+  'mediavault-dev-secret',
+  'replace-with-a-strong-random-secret',
+  'changeme',
+  'change-me',
+  'change_me',
+  'secret',
+  'jwt-secret',
+  'jwt_secret',
+  'default',
+  'default-secret',
+  'dev-secret',
+  'development',
+  'test-secret',
+  'password',
+  'example-secret',
+  'your-secret-here',
+  'your-jwt-secret',
+  'replace-me',
+  'replace_me',
+  'placeholder',
+  'supersecret',
+  'mysecret',
+]);
+
+const PLACEHOLDER_SECRET_PATTERNS = [
+  /mediavault[-_ ]?dev[-_ ]?secret/i,
+  /replace[-_ ]?with/i,
+  /change[-_ ]?me/i,
+  /your[-_ ]?(jwt[-_ ]?)?secret/i,
+];
 
 /**
- * Returns the configured JWT signing secret.
+ * Validates that JWT_SECRET is configured, non-placeholder, and sufficiently strong.
+ *
+ * @param {string | undefined} [rawSecret]
+ * @returns {string}
+ */
+function validateJwtSecret(rawSecret = process.env.JWT_SECRET) {
+  if (typeof rawSecret !== 'string' || rawSecret.trim().length === 0) {
+    throw new Error(
+      `JWT_SECRET environment variable is required and cannot be empty. ${JWT_SECRET_HELP}`
+    );
+  }
+
+  const secret = rawSecret.trim();
+  const normalized = secret.toLowerCase();
+
+  if (
+    KNOWN_WEAK_JWT_SECRETS.has(normalized) ||
+    PLACEHOLDER_SECRET_PATTERNS.some((pattern) => pattern.test(secret))
+  ) {
+    throw new Error(
+      `JWT_SECRET must not use a known fallback or placeholder value. ${JWT_SECRET_HELP}`
+    );
+  }
+
+  if (secret.length < MIN_JWT_SECRET_LENGTH) {
+    throw new Error(
+      `JWT_SECRET must be at least ${MIN_JWT_SECRET_LENGTH} characters long. ${JWT_SECRET_HELP}`
+    );
+  }
+
+  if (new Set(secret).size < MIN_JWT_SECRET_UNIQUE_CHARS) {
+    throw new Error(
+      `JWT_SECRET has insufficient character diversity and appears weak. ${JWT_SECRET_HELP}`
+    );
+  }
+
+  return secret;
+}
+
+/**
+ * Returns the validated JWT signing secret.
  *
  * @returns {string}
  */
 function getJwtSecret() {
-  return process.env.JWT_SECRET || 'mediavault-dev-secret';
+  return validateJwtSecret(process.env.JWT_SECRET);
 }
 
 /**
@@ -73,9 +149,11 @@ async function requireAuth(req, _res, next) {
       throw new AppError(401, 'UNAUTHORIZED', 'Authentication required.');
     }
 
+    const jwtSecret = getJwtSecret();
+
     let payload;
     try {
-      payload = jwt.verify(token, getJwtSecret());
+      payload = jwt.verify(token, jwtSecret, { algorithms: ['HS256'] });
     } catch {
       throw new AppError(401, 'UNAUTHORIZED', 'Invalid or expired authentication token.');
     }
@@ -113,6 +191,7 @@ function requireAdmin(req, _res, next) {
 
 module.exports = {
   getJwtSecret,
+  validateJwtSecret,
   parseDurationToMs,
   getAuthCookieOptions,
   requireAuth,

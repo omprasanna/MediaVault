@@ -1,8 +1,7 @@
 const express = require('express');
-const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
 const { AppError } = require('../utils/errors');
-const { assertPublicUrl } = require('../utils/ssrf');
+const { requestResolvedPublicUrl, resolvePublicUrl } = require('../utils/ssrf');
 const { getByToken, getByUrl } = require('../utils/proxyStore');
 const { sanitizeFilename } = require('../utils/formatMapper');
 
@@ -39,39 +38,78 @@ function buildAttachmentFilename(rawName, contentType) {
   return sanitizeFilename(raw, inferExtensionFromContentType(contentType));
 }
 
+function deleteHeaderCaseInsensitive(headersObj, targetName) {
+  const targetLower = targetName.toLowerCase();
+  for (const key of Object.keys(headersObj)) {
+    if (key.toLowerCase() === targetLower) {
+      delete headersObj[key];
+    }
+  }
+}
+
 /**
- * Fetches an upstream media URL while manually handling redirects and validating
- * the initial target plus every redirect hop against the SSRF guard.
+ * Fetches an upstream media URL while manually handling redirects and pinning
+ * the exact DNS-validated public IP address for each hop against SSRF/rebinding.
  */
-async function fetchWithSsrfGuard(initialUrl, { method, headers, signal }) {
+async function fetchWithSsrfGuard(
+  initialUrl,
+  { method = 'GET', headers = {}, signal, lookup, transport } = {}
+) {
   let currentUrl = initialUrl;
+  let currentMethod = method;
   let initialRootDomain = null;
+  let initialProtocol = null;
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
-    const parsed = await assertPublicUrl(currentUrl);
+    const resolved = await resolvePublicUrl(currentUrl, { lookup });
     if (hop === 0) {
-      initialRootDomain = getRootDomain(parsed.hostname);
+      initialRootDomain = getRootDomain(resolved.hostname);
+      initialProtocol = resolved.url.protocol;
     }
 
     const hopHeaders = { ...headers };
-    if (hop > 0 && getRootDomain(parsed.hostname) !== initialRootDomain) {
-      delete hopHeaders.Cookie;
+    deleteHeaderCaseInsensitive(hopHeaders, 'host');
+    if (
+      hop > 0 &&
+      (getRootDomain(resolved.hostname) !== initialRootDomain ||
+        (initialProtocol === 'https:' && resolved.url.protocol === 'http:'))
+    ) {
+      deleteHeaderCaseInsensitive(hopHeaders, 'cookie');
+      deleteHeaderCaseInsensitive(hopHeaders, 'authorization');
     }
 
-    const upstream = await fetch(parsed.toString(), {
-      method,
+    const upstream = await requestResolvedPublicUrl(resolved, {
+      method: currentMethod,
       headers: hopHeaders,
-      redirect: 'manual',
       signal,
+      transport,
     });
 
     if ([301, 302, 303, 307, 308].includes(upstream.status)) {
       const location = upstream.headers.get('location');
-      await upstream.body?.cancel().catch(() => {});
+      upstream.cancel();
       if (!location) {
         throw new AppError(502, 'PROXY_UPSTREAM_ERROR', 'Upstream redirect missing Location header.');
       }
-      currentUrl = new URL(location, parsed).toString();
+      if (hop === MAX_REDIRECTS) {
+        throw new AppError(502, 'PROXY_UPSTREAM_ERROR', 'Exceeded maximum upstream redirect hops.');
+      }
+
+      let nextUrl;
+      try {
+        nextUrl = new URL(location, resolved.url).toString();
+      } catch {
+        throw new AppError(
+          502,
+          'PROXY_UPSTREAM_ERROR',
+          'Upstream redirect contained an invalid Location header.'
+        );
+      }
+
+      if (upstream.status === 303 && currentMethod !== 'HEAD') {
+        currentMethod = 'GET';
+      }
+      currentUrl = nextUrl;
       continue;
     }
 
@@ -166,7 +204,7 @@ router.get('/', async (req, res, next) => {
       });
 
       if ([403, 405, 501].includes(upstream.status)) {
-        await upstream.body?.cancel().catch(() => {});
+        upstream.cancel();
         const probeController = new AbortController();
         upstream = await fetchWithSsrfGuard(targetUrl, {
           method: 'GET',
@@ -175,8 +213,8 @@ router.get('/', async (req, res, next) => {
         });
         const status = upstream.status;
         if (status < 200 || status >= 400) {
+          upstream.cancel();
           probeController.abort();
-          await upstream.body?.cancel().catch(() => {});
           throw new AppError(
             status >= 400 && status < 500 ? status : 502,
             'PROXY_UPSTREAM_ERROR',
@@ -184,13 +222,13 @@ router.get('/', async (req, res, next) => {
           );
         }
         applyResponseHeaders(res, upstream, requestedFilename);
+        upstream.cancel();
         probeController.abort();
-        await upstream.body?.cancel().catch(() => {});
         return res.status(status).end();
       }
 
       if (!upstream.ok) {
-        await upstream.body?.cancel().catch(() => {});
+        upstream.cancel();
         throw new AppError(
           upstream.status >= 400 && upstream.status < 500 ? upstream.status : 502,
           'PROXY_UPSTREAM_ERROR',
@@ -199,7 +237,7 @@ router.get('/', async (req, res, next) => {
       }
 
       applyResponseHeaders(res, upstream, requestedFilename);
-      await upstream.body?.cancel().catch(() => {});
+      upstream.cancel();
       return res.status(upstream.status).end();
     }
 
@@ -215,15 +253,16 @@ router.get('/', async (req, res, next) => {
     };
     res.on('close', onClientClose);
 
+    let upstream = null;
     try {
-      const upstream = await fetchWithSsrfGuard(targetUrl, {
+      upstream = await fetchWithSsrfGuard(targetUrl, {
         method: 'GET',
         headers: baseHeaders,
         signal: controller.signal,
       });
 
       if (!upstream.ok || !upstream.body) {
-        await upstream.body?.cancel().catch(() => {});
+        upstream.cancel();
         throw new AppError(
           upstream.status >= 400 && upstream.status < 500 ? upstream.status : 502,
           'PROXY_UPSTREAM_ERROR',
@@ -234,8 +273,9 @@ router.get('/', async (req, res, next) => {
       applyResponseHeaders(res, upstream, requestedFilename);
       res.status(upstream.status);
 
-      await pipeline(Readable.fromWeb(upstream.body), res);
+      await pipeline(upstream.body, res);
     } catch (streamErr) {
+      upstream?.cancel();
       if (
         controller.signal.aborted ||
         streamErr?.name === 'AbortError' ||
@@ -254,5 +294,7 @@ router.get('/', async (req, res, next) => {
     res.destroy(err);
   }
 });
+
+router.fetchWithSsrfGuard = fetchWithSsrfGuard;
 
 module.exports = router;

@@ -111,31 +111,35 @@ test('parseDurationToMs parses standard JWT duration strings', () => {
 });
 
 test('requireAuth rejects missing or invalid JWT cookies and attaches req.user when valid', async () => {
-  let capturedErr = null;
-  await requireAuth({ cookies: {} }, {}, (err) => {
-    capturedErr = err;
-  });
-  assert.equal(capturedErr.statusCode, 401);
-  assert.equal(capturedErr.code, 'UNAUTHORIZED');
-
-  capturedErr = null;
-  await requireAuth({ cookies: { jwt: 'invalid.jwt.token' } }, {}, (err) => {
-    capturedErr = err;
-  });
-  assert.equal(capturedErr.statusCode, 401);
+  const prevSecret = process.env.JWT_SECRET;
+  process.env.JWT_SECRET = '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08';
 
   const originalFindById = User.findById;
-  User.findById = () => ({
-    select: () => ({
-      lean: async () => ({
-        _id: { toString: () => '65b2d8e9f1a23c0012a45bc8' },
-        email: 'admin@mediavault.local',
-        role: 'admin',
-      }),
-    }),
-  });
 
   try {
+    let capturedErr = null;
+    await requireAuth({ cookies: {} }, {}, (err) => {
+      capturedErr = err;
+    });
+    assert.equal(capturedErr.statusCode, 401);
+    assert.equal(capturedErr.code, 'UNAUTHORIZED');
+
+    capturedErr = null;
+    await requireAuth({ cookies: { jwt: 'invalid.jwt.token' } }, {}, (err) => {
+      capturedErr = err;
+    });
+    assert.equal(capturedErr.statusCode, 401);
+
+    User.findById = () => ({
+      select: () => ({
+        lean: async () => ({
+          _id: { toString: () => '65b2d8e9f1a23c0012a45bc8' },
+          email: 'admin@mediavault.local',
+          role: 'admin',
+        }),
+      }),
+    });
+
     const validToken = jwt.sign(
       { sub: '65b2d8e9f1a23c0012a45bc8', email: 'admin@mediavault.local', role: 'admin' },
       getJwtSecret(),
@@ -154,6 +158,8 @@ test('requireAuth rejects missing or invalid JWT cookies and attaches req.user w
     });
   } finally {
     User.findById = originalFindById;
+    if (prevSecret === undefined) delete process.env.JWT_SECRET;
+    else process.env.JWT_SECRET = prevSecret;
   }
 });
 

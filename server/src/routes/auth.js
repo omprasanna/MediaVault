@@ -13,6 +13,29 @@ const router = express.Router();
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+function isDuplicateKeyError(err) {
+  return Boolean(err && (err.code === 11000 || err.errorResponse?.code === 11000));
+}
+
+function isAdminRoleDuplicateError(err) {
+  if (!isDuplicateKeyError(err)) {
+    return false;
+  }
+
+  const keyPattern = err.keyPattern || err.errorResponse?.keyPattern;
+  if (keyPattern && Object.prototype.hasOwnProperty.call(keyPattern, 'role')) {
+    return true;
+  }
+
+  const keyValue = err.keyValue || err.errorResponse?.keyValue;
+  if (keyValue && keyValue.role === 'admin') {
+    return true;
+  }
+
+  const message = String(err.message || '');
+  return message.includes('unique_admin_role') || /dup key:\s*\{\s*role:/i.test(message);
+}
+
 function serializeUser(user) {
   return {
     id: user._id.toString(),
@@ -55,22 +78,36 @@ router.post('/register', async (req, res, next) => {
       throw new AppError(409, 'EMAIL_EXISTS', 'An account with this email already exists.');
     }
 
-    const userCount = await User.countDocuments();
-    const role = userCount === 0 ? 'admin' : 'user';
     const passwordHash = await bcrypt.hash(password, 12);
+    const hasExistingUsers = Boolean(await User.exists({}));
+    const initialRole = hasExistingUsers ? 'user' : 'admin';
 
     let user;
     try {
       user = await User.create({
         email: rawEmail,
         passwordHash,
-        role,
+        role: initialRole,
       });
     } catch (createErr) {
-      if (createErr && createErr.code === 11000) {
+      if (initialRole === 'admin' && isAdminRoleDuplicateError(createErr)) {
+        try {
+          user = await User.create({
+            email: rawEmail,
+            passwordHash,
+            role: 'user',
+          });
+        } catch (retryErr) {
+          if (isDuplicateKeyError(retryErr)) {
+            throw new AppError(409, 'EMAIL_EXISTS', 'An account with this email already exists.');
+          }
+          throw retryErr;
+        }
+      } else if (isDuplicateKeyError(createErr)) {
         throw new AppError(409, 'EMAIL_EXISTS', 'An account with this email already exists.');
+      } else {
+        throw createErr;
       }
-      throw createErr;
     }
 
     return res.status(201).json({

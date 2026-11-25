@@ -11,11 +11,14 @@ import {
   type DragEvent,
   type KeyboardEvent,
 } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useTheme } from 'next-themes';
 import useSWR, { useSWRConfig } from 'swr';
 import {
   AlertCircle,
+  ArrowRight,
+  BookOpen,
   Camera,
   CheckCircle2,
   CloudUpload,
@@ -204,6 +207,24 @@ export default function SettingsPage() {
 
   useEffect(() => {
     setMounted(true);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    if (window.location.hash === '#age-restricted-guide') {
+      const target = document.getElementById('age-restricted-guide');
+      if (target) {
+        const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        requestAnimationFrame(() => {
+          target.scrollIntoView({
+            behavior: prefersReduced ? 'auto' : 'smooth',
+            block: 'start',
+          });
+        });
+      }
+    }
   }, []);
 
   const cookieMap = useMemo(() => {
@@ -612,6 +633,172 @@ export default function SettingsPage() {
               <span>Remove Dailymotion</span>
             </button>
           )}
+        </div>
+      </section>
+
+      {/* Section 2.5: How to Access Age-Restricted Videos Guide */}
+      <section
+        id="age-restricted-guide"
+        aria-labelledby="age-restricted-guide-heading"
+        data-testid="age-restricted-guide"
+        className="scroll-mt-20 flex flex-col gap-4"
+      >
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <BookOpen className="h-4 w-4 text-accent-text" aria-hidden="true" />
+              <h2
+                id="age-restricted-guide-heading"
+                className="text-sm font-semibold text-ink-primary"
+              >
+                How to Access Age-Restricted Videos
+              </h2>
+            </div>
+            <span className="rounded border border-border-default bg-surface px-2 py-0.5 font-mono text-[11px] text-ink-secondary">
+              Step-by-Step Guide
+            </span>
+          </div>
+          <p className="text-[13px] text-ink-secondary">
+            Age-restricted, login-walled, or bot-checked videos require a logged-in browser cookie session.
+          </p>
+        </div>
+
+        <div className="rounded-xl border border-border-default bg-surface p-4 shadow-[var(--shadow-xs)]">
+          <ol className="flex flex-col gap-2.5">
+            <li className="flex items-start gap-3 rounded-lg border border-border-subtle bg-surface-elevated p-3">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-accent-border bg-accent-soft font-mono text-xs font-semibold text-accent-text">
+                1
+              </span>
+              <div className="flex min-w-0 flex-1 flex-col gap-1">
+                <p className="text-[13px] font-semibold text-ink-primary">
+                  Sign in to the platform in your browser
+                </p>
+                <p className="text-xs leading-relaxed text-ink-secondary">
+                  Open YouTube, Instagram, X, Facebook, or Dailymotion and sign into an account
+                  that can view the video.
+                </p>
+                <p className="rounded-md border border-border-subtle bg-surface px-2.5 py-1.5 text-[11px] leading-relaxed text-ink-secondary">
+                  <strong className="font-semibold text-ink-primary">YouTube tip:</strong> Sign in
+                  inside a fresh <strong className="font-medium text-ink-primary">Incognito / Private window</strong>,
+                  export cookies, and immediately close that window so YouTube does not rotate and
+                  invalidate your exported session.
+                </p>
+              </div>
+            </li>
+
+            <li className="flex items-start gap-3 rounded-lg border border-border-subtle bg-surface-elevated p-3">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-accent-border bg-accent-soft font-mono text-xs font-semibold text-accent-text">
+                2
+              </span>
+              <div className="flex min-w-0 flex-1 flex-col gap-1">
+                <p className="text-[13px] font-semibold text-ink-primary">
+                  Export cookies in Netscape <code className="font-mono text-xs">cookies.txt</code> format
+                </p>
+                <p className="text-xs leading-relaxed text-ink-secondary">
+                  Use a local browser cookie exporter extension (such as{' '}
+                  <span className="font-medium text-ink-primary">Get cookies.txt LOCALLY</span> for
+                  Chrome/Edge or <span className="font-medium text-ink-primary">cookies.txt</span>{' '}
+                  for Firefox) while on that site and save the file as{' '}
+                  <code className="font-mono text-[11px]">.txt</code> (Netscape HTTP Cookie File
+                  format, max 512 KB).
+                </p>
+              </div>
+            </li>
+
+            <li className="flex items-start gap-3 rounded-lg border border-border-subtle bg-surface-elevated p-3">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-accent-border bg-accent-soft font-mono text-xs font-semibold text-accent-text">
+                3
+              </span>
+              <div className="flex min-w-0 flex-1 flex-col gap-2">
+                <div className="flex flex-col gap-1">
+                  <p className="text-[13px] font-semibold text-ink-primary">
+                    Upload <code className="font-mono text-xs">cookies.txt</code> in Platform Cookies above
+                  </p>
+                  <p className="text-xs leading-relaxed text-ink-secondary">
+                    Click <strong className="font-medium text-ink-primary">Upload cookies.txt</strong>{' '}
+                    on the matching platform card above, or select a platform pill and drop the file
+                    into the Upload Dropzone.
+                  </p>
+                </div>
+                <div>
+                  <button
+                    type="button"
+                    disabled={uploadingPlatform === 'youtube'}
+                    onClick={() => triggerUploadFor('youtube')}
+                    data-testid="guide-upload-youtube-btn"
+                    className="mv-focus inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-lg border border-border-default bg-surface px-3 text-xs font-medium text-ink-primary shadow-[var(--shadow-xs)] transition-colors hover:border-border-strong hover:bg-surface-high disabled:opacity-50"
+                  >
+                    <Upload className="h-3.5 w-3.5 text-accent-text" aria-hidden="true" />
+                    <span>Upload YouTube cookies.txt</span>
+                  </button>
+                </div>
+              </div>
+            </li>
+
+            <li className="flex items-start gap-3 rounded-lg border border-border-subtle bg-surface-elevated p-3">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-accent-border bg-accent-soft font-mono text-xs font-semibold text-accent-text">
+                4
+              </span>
+              <div className="flex min-w-0 flex-1 flex-col gap-2">
+                <div className="flex flex-col gap-1">
+                  <p className="text-[13px] font-semibold text-ink-primary">
+                    Enable &ldquo;Use saved cookies&rdquo; in Downloader
+                  </p>
+                  <p className="text-xs leading-relaxed text-ink-secondary">
+                    Return to Downloader, toggle{' '}
+                    <strong className="font-medium text-ink-primary">Use saved cookies</strong> on
+                    below the URL field, and click{' '}
+                    <strong className="font-medium text-ink-primary">Inspect</strong> (or click{' '}
+                    <strong className="font-medium text-ink-primary">Retry with Cookies</strong> on
+                    a failed job in Queue &amp; History).
+                  </p>
+                </div>
+                <div>
+                  <Link
+                    href="/"
+                    data-testid="guide-open-downloader-link"
+                    className="mv-focus inline-flex h-8 items-center gap-1.5 rounded-lg bg-accent px-3 text-xs font-semibold text-on-accent shadow-[var(--shadow-xs)] transition-colors hover:bg-accent-hover"
+                  >
+                    <span>Open Downloader</span>
+                    <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+                  </Link>
+                </div>
+              </div>
+            </li>
+          </ol>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <details className="mv-details rounded-xl border border-border-default bg-surface shadow-[var(--shadow-xs)]">
+            <summary className="px-4 py-3 text-[13px] font-medium text-ink-primary transition-colors hover:text-accent-text">
+              <span>Why did my YouTube cookies expire or trigger a bot check?</span>
+            </summary>
+            <div className="border-t border-border-subtle px-4 py-3 text-xs leading-relaxed text-ink-secondary">
+              YouTube frequently rotates authentication cookies while you keep browsing in the same
+              signed-in browser profile, which invalidates older exported files. To keep cookies
+              valid longer, sign in inside a fresh Incognito/Private window, export{' '}
+              <code className="font-mono text-[11px]">cookies.txt</code>, close that window right
+              away, and click <strong className="font-medium text-ink-primary">Replace</strong> on
+              the YouTube card above.
+            </div>
+          </details>
+
+          <details className="mv-details rounded-xl border border-border-default bg-surface shadow-[var(--shadow-xs)]">
+            <summary className="px-4 py-3 text-[13px] font-medium text-ink-primary transition-colors hover:text-accent-text">
+              <span>Are my cookies stored safely and sent on every download?</span>
+            </summary>
+            <div className="border-t border-border-subtle px-4 py-3 text-xs leading-relaxed text-ink-secondary">
+              Cookie files stay on your self-hosted Docker volume inside{' '}
+              <code className="font-mono text-[11px]">./data/cookies</code> with{' '}
+              <code className="font-mono text-[11px]">0600</code> permissions. MediaVault never
+              attaches them automatically — they are only passed to{' '}
+              <code className="font-mono text-[11px]">yt-dlp</code> when{' '}
+              <strong className="font-medium text-ink-primary">Use saved cookies</strong> or{' '}
+              <strong className="font-medium text-ink-primary">Retry with Cookies</strong> is
+              explicitly enabled, and you can delete any platform file at any time with the trash
+              icon above.
+            </div>
+          </details>
         </div>
       </section>
 

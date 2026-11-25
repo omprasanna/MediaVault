@@ -17,7 +17,7 @@ const userSchema = new mongoose.Schema(
     role: {
       type: String,
       enum: ['admin', 'user'],
-      default: 'admin',
+      default: 'user',
     },
     lastLoginAt: {
       type: Date,
@@ -25,6 +25,15 @@ const userSchema = new mongoose.Schema(
     },
   },
   { timestamps: true }
+);
+
+userSchema.index(
+  { role: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { role: 'admin' },
+    name: 'unique_admin_role',
+  }
 );
 
 module.exports = mongoose.model('User', userSchema);

@@ -4,7 +4,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { AppError } = require('./errors');
-const { assertPublicUrl } = require('./ssrf');
+const { resolvePublicUrl } = require('./ssrf');
+const {
+  buildProxyChildEnv,
+  createPinnedSsrfProxy,
+  redactProxyCredentials,
+} = require('./ssrfProxy');
 
 const ALLOWED_PLATFORMS = ['youtube', 'instagram', 'facebook', 'x', 'dailymotion'];
 
@@ -172,10 +177,10 @@ function extractYtDlpErrorMessage(stderr) {
     .map((line) => line.trim())
     .filter(Boolean);
   const errorLine = [...lines].reverse().find((line) => /^ERROR:/i.test(line));
-  if (errorLine) {
-    return errorLine.replace(/^ERROR:\s*/i, '');
-  }
-  return lines[lines.length - 1] || 'yt-dlp failed to process the requested media URL.';
+  const rawMessage = errorLine
+    ? errorLine.replace(/^ERROR:\s*/i, '')
+    : lines[lines.length - 1] || 'yt-dlp failed to process the requested media URL.';
+  return redactProxyCredentials(rawMessage);
 }
 
 /**
@@ -183,10 +188,13 @@ function extractYtDlpErrorMessage(stderr) {
  * Always enforces `--js-runtimes node`.
  *
  * @param {string[]} args
- * @param {{ timeoutMs?: number, maxStdoutBytes?: number }} [options]
+ * @param {{ timeoutMs?: number, maxStdoutBytes?: number, env?: NodeJS.ProcessEnv }} [options]
  * @returns {Promise<{ stdout: string, stderr: string }>}
  */
-function spawnYtDlp(args, { timeoutMs = 90000, maxStdoutBytes = 20 * 1024 * 1024 } = {}) {
+function spawnYtDlp(
+  args,
+  { timeoutMs = 90000, maxStdoutBytes = 20 * 1024 * 1024, env = process.env } = {}
+) {
   return new Promise((resolve, reject) => {
     const finalArgs = args.includes('--js-runtimes')
       ? [...args]
@@ -195,6 +203,7 @@ function spawnYtDlp(args, { timeoutMs = 90000, maxStdoutBytes = 20 * 1024 * 1024
     const child = spawn('yt-dlp', finalArgs, {
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
+      env,
     });
 
     const stdoutChunks = [];
@@ -280,7 +289,7 @@ function spawnYtDlp(args, { timeoutMs = 90000, maxStdoutBytes = 20 * 1024 * 1024
  * Builds yt-dlp inspection CLI arguments. In playlist mode, `--playlist-end` is omitted
  * unless a positive `maxPlaylistItems` cap is configured (0 = unlimited).
  *
- * @param {{ playlistMode: boolean, maxPlaylistItems?: number, forceIpv4?: boolean, cookiePath?: string | null, url: string }} params
+ * @param {{ playlistMode: boolean, maxPlaylistItems?: number, forceIpv4?: boolean, cookiePath?: string | null, proxyUrl?: string | null, url: string }} params
  * @returns {string[]}
  */
 function buildInspectArgs({
@@ -288,6 +297,7 @@ function buildInspectArgs({
   maxPlaylistItems = 0,
   forceIpv4 = true,
   cookiePath = null,
+  proxyUrl = null,
   url,
 }) {
   const args = playlistMode
@@ -306,19 +316,27 @@ function buildInspectArgs({
     args.push('--cookies', cookiePath);
   }
 
+  if (proxyUrl) {
+    args.push('--proxy', proxyUrl, '--geo-verification-proxy', proxyUrl);
+  }
+
   args.push('--', url);
   return args;
 }
 
 /**
- * Inspects a media URL via yt-dlp JSON dump after strict domain allowlisting and SSRF checks.
+ * Inspects a media URL via yt-dlp JSON dump after strict domain allowlisting and
+ * pinned SSRF proxy isolation.
  *
  * @param {string} rawUrl
- * @param {{ useCookies?: boolean, includePlaylist?: boolean }} [options]
+ * @param {{ useCookies?: boolean, includePlaylist?: boolean, lookup?: Function, spawnImpl?: Function }} [options]
  */
-async function inspectMediaUrl(rawUrl, { useCookies = false, includePlaylist = false } = {}) {
+async function inspectMediaUrl(
+  rawUrl,
+  { useCookies = false, includePlaylist = false, lookup, spawnImpl } = {}
+) {
   const validated = validateMediaUrl(rawUrl);
-  await assertPublicUrl(validated.url);
+  const resolved = await resolvePublicUrl(validated.url, { lookup });
 
   const playlistMode =
     includePlaylist === true
@@ -327,25 +345,48 @@ async function inspectMediaUrl(rawUrl, { useCookies = false, includePlaylist = f
 
   const rawMax = Number(process.env.MAX_PLAYLIST_ITEMS || 0);
   const maxPlaylistItems = Number.isFinite(rawMax) && rawMax > 0 ? Math.floor(rawMax) : 0;
+  const forceIpv4 = process.env.YTDLP_FORCE_IPV4 !== 'false';
 
   let cookieHandle = null;
+  let ssrfProxy = null;
   try {
     if (useCookies === true) {
       cookieHandle = await prepareCookieArg(validated.platform);
     }
 
+    ssrfProxy = await createPinnedSsrfProxy({
+      pinnedHosts: new Map([[resolved.hostname, resolved.addresses]]),
+      preferIpv4: forceIpv4,
+      lookup,
+    });
+
     const args = buildInspectArgs({
       playlistMode,
       maxPlaylistItems,
-      forceIpv4: process.env.YTDLP_FORCE_IPV4 !== 'false',
+      forceIpv4,
       cookiePath: cookieHandle ? cookieHandle.cookiePath : null,
+      proxyUrl: ssrfProxy.proxyUrl,
       url: validated.url,
     });
 
-    const { stdout } = await spawnYtDlp(args, {
-      timeoutMs: playlistMode ? 180000 : 90000,
-      maxStdoutBytes: playlistMode ? 64 * 1024 * 1024 : 20 * 1024 * 1024,
-    });
+    const runSpawn = spawnImpl || spawnYtDlp;
+    let stdout;
+    try {
+      ({ stdout } = await runSpawn(args, {
+        timeoutMs: playlistMode ? 180000 : 90000,
+        maxStdoutBytes: playlistMode ? 64 * 1024 * 1024 : 20 * 1024 * 1024,
+        env: buildProxyChildEnv(ssrfProxy.proxyUrl),
+      }));
+    } catch (spawnErr) {
+      if (ssrfProxy.getLastBlockedError()) {
+        throw new AppError(
+          400,
+          'INVALID_URL',
+          'Target URL or redirect resolved to a restricted IP address.'
+        );
+      }
+      throw spawnErr;
+    }
 
     let rawData;
     try {
@@ -364,6 +405,9 @@ async function inspectMediaUrl(rawUrl, { useCookies = false, includePlaylist = f
       rawData,
     };
   } finally {
+    if (ssrfProxy) {
+      await ssrfProxy.close();
+    }
     if (cookieHandle) {
       await cookieHandle.cleanup();
     }

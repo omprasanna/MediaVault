@@ -1,9 +1,11 @@
 'use client';
 
 import { useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
+import Link from 'next/link';
 import {
   AlertCircle,
   ClipboardPaste,
+  HelpCircle,
   Link2,
   Loader2,
   Lock,
@@ -35,6 +37,11 @@ function isValidHttpUrl(candidate: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isAuthOrAgeError(message: string | null | undefined): boolean {
+  if (!message) return false;
+  return /age|cookie|sign\s?in|auth|private|login|members?|bot|403/i.test(message);
 }
 
 export function UrlInputCard({
@@ -240,23 +247,34 @@ export function UrlInputCard({
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-2 px-0.5 pt-0.5">
-            <label
-              htmlFor={cookiesId}
-              className="flex cursor-pointer select-none items-center gap-2 text-xs text-ink-secondary hover:text-ink-primary"
-            >
-              <input
-                id={cookiesId}
-                type="checkbox"
-                role="switch"
-                checked={useCookies}
-                onChange={(e) => onUseCookiesChange(e.target.checked)}
-                {...switchProps}
-                data-testid="cookies-switch"
-                className="mv-switch"
-              />
-              <Lock className="h-3.5 w-3.5 text-ink-muted" aria-hidden="true" />
-              <span>Use saved cookies</span>
-            </label>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+              <label
+                htmlFor={cookiesId}
+                className="flex cursor-pointer select-none items-center gap-2 text-xs text-ink-secondary hover:text-ink-primary"
+              >
+                <input
+                  id={cookiesId}
+                  type="checkbox"
+                  role="switch"
+                  checked={useCookies}
+                  onChange={(e) => onUseCookiesChange(e.target.checked)}
+                  {...switchProps}
+                  data-testid="cookies-switch"
+                  className="mv-switch"
+                />
+                <Lock className="h-3.5 w-3.5 text-ink-muted" aria-hidden="true" />
+                <span>Use saved cookies</span>
+              </label>
+
+              <Link
+                href="/settings#age-restricted-guide"
+                data-testid="age-restricted-guide-link"
+                className="mv-focus inline-flex items-center gap-1 rounded px-1 py-0.5 text-xs font-medium text-accent-text transition-colors hover:underline underline-offset-4"
+              >
+                <HelpCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                <span>How to access age-restricted videos</span>
+              </Link>
+            </div>
 
             {clipboardHint && (
               <span className="font-mono text-[11px] text-ink-muted">{clipboardHint}</span>
@@ -272,6 +290,15 @@ export function UrlInputCard({
               <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
               <span>
                 <strong className="font-semibold">Error:</strong> {displayError}
+                {isAuthOrAgeError(displayError) && (
+                  <Link
+                    href="/settings#age-restricted-guide"
+                    data-testid="error-age-restricted-guide-link"
+                    className="ml-1.5 font-semibold underline underline-offset-2 hover:opacity-90"
+                  >
+                    See age-restricted video guide →
+                  </Link>
+                )}
               </span>
             </div>
           )}
@@ -371,6 +398,15 @@ export function UrlInputCard({
             <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
             <span>
               <strong className="font-semibold">Error:</strong> {displayError}
+              {isAuthOrAgeError(displayError) && (
+                <Link
+                  href="/settings#age-restricted-guide"
+                  data-testid="error-age-restricted-guide-link"
+                  className="ml-1.5 font-semibold underline underline-offset-2 hover:opacity-90"
+                >
+                  See age-restricted video guide →
+                </Link>
+              )}
             </span>
           </div>
         )}
@@ -418,6 +454,15 @@ export function UrlInputCard({
                 <span>Single item only</span>
               </label>
             )}
+
+            <Link
+              href="/settings#age-restricted-guide"
+              data-testid="age-restricted-guide-link"
+              className="mv-focus inline-flex items-center gap-1 rounded px-1 py-0.5 text-xs font-medium text-accent-text transition-colors hover:underline underline-offset-4"
+            >
+              <HelpCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              <span>How to access age-restricted videos</span>
+            </Link>
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5">
