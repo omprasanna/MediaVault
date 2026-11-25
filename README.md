@@ -6,15 +6,13 @@ A private, self-hosted multi-platform media downloader web app (supports YouTube
 
 ## Architecture
 
-MediaVault runs inside a dedicated Docker network (`mediavault-net`) composed of six services configured in [docker-compose.yml](./docker-compose.yml) and [docker-compose.prod.yml](./docker-compose.prod.yml):
+MediaVault runs inside a dedicated Docker network (`mediavault-net`) configured in [docker-compose.yml](./docker-compose.yml). The app, API, and worker run together in one container alongside MongoDB and Redis:
 
 | Service | Purpose |
 | :--- | :--- |
 | `mongo` | MongoDB 7 persistence (`users`, `jobs`, `batches`, `cookies` metadata) |
 | `redis` | Redis 7 backing BullMQ job queues and transient download telemetry |
-| `api` | Node.js + Express REST API, JWT auth, fast-path `/api/proxy`, and `/api/system` |
-| `worker` | BullMQ worker (`concurrency: 2`, `--js-runtimes node`, 1080p stream-copy muxing & MP3 extraction, clean-filename persistent host Downloads storage) |
-| `client` | Next.js App Router UI (`dev` HMR target by default; Next.js `standalone` `prod` target via `docker-compose.prod.yml`) |
+| `mediavault` | Unified Next.js UI, Node.js + Express REST API, and BullMQ worker |
 | `cloudflared` | Optional Cloudflare Tunnel (`profiles: ["tunnel"]`) for encrypted phone/remote access |
 
 ---
@@ -30,23 +28,11 @@ MediaVault runs inside a dedicated Docker network (`mediavault-net`) composed of
 
    Paste the generated 64-character hex value into `JWT_SECRET=` in `.env` (or use `openssl rand -hex 32`).
 
-2. Start the stack (use **only one** deployment mode at a time — `docker-compose.hub.yml` already runs `api` + `worker` + `client` together on port `3000`, so do not run `docker-compose.yml -f docker-compose.prod.yml` alongside it):
-
-   - **Single-image Docker Hub deployment (Recommended for self-hosters — no build required):**
-     Runs the unified Alpine image [`omprasannasahoo181/mediavault:latest`](https://hub.docker.com/r/omprasannasahoo181/mediavault) (`api` + `worker` + Next.js `client` in one container) alongside MongoDB and Redis via [docker-compose.hub.yml](./docker-compose.hub.yml):
-     ```powershell
-     docker compose -f docker-compose.hub.yml pull
-     docker compose -f docker-compose.hub.yml up -d --remove-orphans
-     ```
-     *(If using Cloudflare Tunnel with `docker-compose.hub.yml`, point your tunnel's Public Hostname service URL to `http://mediavault:3000`.)*
-   - **Local development** (with source hot reload):
-     ```powershell
-     docker compose up -d --build --remove-orphans
-     ```
-   - **Daily source-built production mode** (Next.js `standalone` build + `unless-stopped` restarts):
-     ```powershell
-     docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build --remove-orphans
-     ```
+2. Pull the published app image and start the stack:
+   ```powershell
+   docker compose pull mediavault
+   docker compose up -d
+   ```
 
 3. Open `http://localhost:3000`.
 
@@ -66,41 +52,93 @@ Follow these steps in order before exposing MediaVault on a phone or external ne
      ALLOW_REGISTRATION=false
      ```
 
-3. **Recreate `api` to apply the updated `.env`**
-   - Run:
-     ```powershell
-     docker compose up -d api
-     ```
-     *(In production mode: `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d api`.)*
-   - **Important:** Use `docker compose up -d api` — **not** `docker compose restart api`. `restart` reuses the existing container environment and does not reload edited `.env` values.
+3. **Recreate the app container to apply the updated `.env`**
+   ```powershell
+   docker compose up -d mediavault
+   ```
+   - **Important:** Use `up -d` — **not** `docker compose restart`. `restart` reuses the existing container environment and does not reload edited `.env` values.
    - Verify registration is locked (`403 Forbidden` with `REGISTRATION_DISABLED`):
      ```powershell
-     curl.exe -sS -i -X POST http://localhost:5000/api/auth/register `
+     curl.exe -sS -i -X POST http://localhost:3000/api/auth/register `
        -H "Content-Type: application/json" `
        -d '{"email":"blocked@mediavault.local","password":"Password123!"}'
      ```
 
-4. **Start Cloudflare Tunnel on demand (Optional Phone / Remote Access)**
-   - In the **Cloudflare Zero Trust Dashboard** (**Networks → Tunnels → Create a tunnel → Cloudflared**):
-     1. Copy your tunnel token into `.env`:
-        ```env
-        CLOUDFLARE_TUNNEL_TOKEN=eyJhIjoi...
-        ```
-     2. Under the tunnel's **Public Hostname** tab, configure your hostname to route traffic to the internal Docker origin **`http://client:3000`**.
-   - *(Optional HTTPS hardening)* When accessing MediaVault strictly over HTTPS (via Cloudflare Tunnel) and `localhost`, set `COOKIE_SECURE=true` in `.env` and recreate `api` (`docker compose up -d api`) so the `jwt` auth cookie carries the `Secure` attribute.
-   - **Start the tunnel when needed:**
-     ```powershell
-     docker compose --profile tunnel up -d
-     ```
-     *(Or in production mode: `docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile tunnel up -d`.)*
-   - **Stop the tunnel when finished:**
+4. **Enable HTTPS-only cookies (if exposing remotely via Cloudflare Tunnel)**
+   - When accessing MediaVault over HTTPS (`https://*.trycloudflare.com` or your custom Cloudflare domain) and `localhost`, set `COOKIE_SECURE=true` in `.env` and recreate the container with `docker compose up -d mediavault` before starting the tunnel below.
+
+---
+
+## Remote Access via Cloudflare Tunnel (Step-by-Step)
+
+You can expose MediaVault on an encrypted `https://` URL for your phone or remote devices using either an instant temporary Quick Tunnel or a permanent Named Tunnel.
+
+### Option A — Instant Temporary URL (`*.trycloudflare.com`, no account required)
+
+1. **Make sure the MediaVault stack is already running:**
+   ```powershell
+   docker compose up -d
+   ```
+
+2. **Start a Quick Tunnel and get your HTTPS URL:**
+   Do **not** use `http://localhost:3000` inside the `--url` flag — inside the `cloudflared` container, `localhost` points to `cloudflared` itself. Use the Compose service name, `http://mediavault:3000`:
+   ```powershell
+   docker compose --profile tunnel run --rm --no-deps -e TUNNEL_TOKEN= cloudflared tunnel --no-autoupdate --url http://mediavault:3000 2>&1 | ForEach-Object {
+     $line = "$_"
+     if ($line -match '(https://[a-z0-9-]+\.trycloudflare\.com)') {
+       $Matches[1]
+     } elseif ($line -match '\b(ERR|WRN)\b') {
+       $line
+     }
+   }
+   ```
+   This prints the temporary URL without the routine startup logs, while still showing warnings/errors. Press `Ctrl+C` to stop the tunnel.
+
+3. **Connect:** Open the printed URL in your phone or remote browser and sign in with your MediaVault account. Quick Tunnel URLs change every time you restart the tunnel.
+
+---
+
+### Option B — Permanent Custom Domain URL (Named Tunnel via Cloudflare Zero Trust)
+
+Use this option if you own a domain on Cloudflare and want a fixed URL (for example `https://media.yourdomain.com`).
+
+1. **Lock registration & enable secure cookies in `.env`:**
+   ```env
+   ALLOW_REGISTRATION=false
+   COOKIE_SECURE=true
+   ```
+   Recreate MediaVault to apply `.env`:
+   ```powershell
+   docker compose up -d mediavault
+   ```
+
+2. **Create a Tunnel in the Cloudflare Zero Trust Dashboard:**
+   - Go to **Networks → Tunnels → Create a tunnel → Cloudflared**, give it a name (e.g., `mediavault`), and click **Save tunnel**.
+   - Under **Choose your environment → Docker**, copy the tunnel token (`eyJhIjoi...`).
+
+3. **Set the Public Hostname & internal Docker origin:**
+   - Open the tunnel's **Public Hostname** tab and click **Add a public hostname**.
+   - Enter your subdomain & domain (e.g., `media.yourdomain.com`).
+   - Set **Type** to **`HTTP`** and **URL** to `mediavault:3000`.
+
+4. **Save the token in `.env`:**
+   ```env
+   CLOUDFLARE_TUNNEL_TOKEN=eyJhIjoi...
+   ```
+
+5. **Start the tunnel and verify the connection:**
+   ```powershell
+   docker compose --profile tunnel up -d
+   docker compose --profile tunnel logs --tail 25 cloudflared
+   ```
+
+   Look for `Registered tunnel connection` in the logs.
+
+6. **Connect & stop when finished:**
+   - Open `https://<your-public-hostname>` (e.g., `https://media.yourdomain.com`) from any device and sign in.
+   - Stop the tunnel whenever remote access is no longer needed:
      ```powershell
      docker compose --profile tunnel stop cloudflared
-     ```
-   - **Ad-hoc Quick Tunnel (without a named tunnel token):**
-     If you only need a temporary `*.trycloudflare.com` URL without configuring a dashboard token, run:
-     ```powershell
-     docker compose --profile tunnel run --rm -e TUNNEL_TOKEN= cloudflared tunnel --no-autoupdate --url http://client:3000
      ```
 
 ---

@@ -33,92 +33,8 @@ services:
       timeout: 5s
       retries: 5
 
-  api:
-    build:
-      context: ./server
-      dockerfile: Dockerfile
-    image: mediavault-server:latest
-    container_name: mediavault-api
-    restart: unless-stopped
-    command: ["node", "src/api.js"]
-    ports:
-      - "${API_PORT:-5000}:5000"
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      NODE_ENV: ${NODE_ENV:-development}
-      PORT: "5000"
-      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/mediavault}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
-      # Required: set a cryptographically secure random secret in .env
-      # Generate via: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env to a cryptographically secure random secret (e.g. openssl rand -hex 32)}
-      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
-      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-true}
-      COOKIE_SECURE: ${COOKIE_SECURE:-false}
-      DOWNLOADS_DIR: ${DOWNLOADS_DIR:-/data/downloads}
-      COOKIES_DIR: ${COOKIES_DIR:-/data/cookies}
-      DOWNLOAD_TTL_MINUTES: ${DOWNLOAD_TTL_MINUTES:-30}
-      MAX_PLAYLIST_ITEMS: ${MAX_PLAYLIST_ITEMS:-0}
-      MAX_BATCH_ITEMS: ${MAX_BATCH_ITEMS:-0}
-      MIN_FREE_DISK_BYTES: ${MIN_FREE_DISK_BYTES:-2147483648}
-    volumes:
-      - ${HOST_DOWNLOADS_DIR:-./data/downloads}:/data/downloads
-      - ./data/cookies:/data/cookies
-    depends_on:
-      mongo:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - mediavault-net
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:5000/api/health || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
-  worker:
-    build:
-      context: ./server
-      dockerfile: Dockerfile
-    image: mediavault-server:latest
-    container_name: mediavault-worker
-    restart: unless-stopped
-    command: ["node", "src/worker.js"]
-    mem_limit: 2g
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      NODE_ENV: ${NODE_ENV:-development}
-      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/mediavault}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
-      DOWNLOADS_DIR: ${DOWNLOADS_DIR:-/data/downloads}
-      COOKIES_DIR: ${COOKIES_DIR:-/data/cookies}
-      DOWNLOAD_TTL_MINUTES: ${DOWNLOAD_TTL_MINUTES:-30}
-      CLEANUP_INTERVAL_MINUTES: ${CLEANUP_INTERVAL_MINUTES:-5}
-      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
-      MIN_FREE_DISK_BYTES: ${MIN_FREE_DISK_BYTES:-2147483648}
-    volumes:
-      - ${HOST_DOWNLOADS_DIR:-./data/downloads}:/data/downloads
-      - ./data/cookies:/data/cookies:ro
-    depends_on:
-      mongo:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - mediavault-net
-
-  client:
-    build:
-      context: ./client
-      dockerfile: Dockerfile
-      target: dev
-    container_name: mediavault-client
+  mediavault:
+    image: omprasannasahoo181/mediavault:latest
     restart: unless-stopped
     ports:
       - "${CLIENT_PORT:-3000}:3000"
@@ -126,19 +42,41 @@ services:
       - path: .env
         required: false
     environment:
-      NODE_ENV: development
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:5000}
-      INTERNAL_API_URL: ${INTERNAL_API_URL:-http://api:5000}
-      WATCHPACK_POLLING: "true"
+      NODE_ENV: production
+      APP_ROLE: all
+      PORT: "3000"
+      API_PORT: "5000"
+      INTERNAL_API_URL: http://127.0.0.1:5000
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/mediavault}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      JWT_SECRET: ${JWT_SECRET:?Set a 32+ character JWT_SECRET in .env}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-true}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      DOWNLOADS_DIR: /data/downloads
+      COOKIES_DIR: /data/cookies
+      DOWNLOAD_TTL_MINUTES: ${DOWNLOAD_TTL_MINUTES:-30}
+      CLEANUP_INTERVAL_MINUTES: ${CLEANUP_INTERVAL_MINUTES:-5}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      MAX_PLAYLIST_ITEMS: ${MAX_PLAYLIST_ITEMS:-0}
+      MAX_BATCH_ITEMS: ${MAX_BATCH_ITEMS:-0}
+      MIN_FREE_DISK_BYTES: ${MIN_FREE_DISK_BYTES:-2147483648}
     volumes:
-      - ./client:/app
-      - /app/node_modules
-      - /app/.next
-    depends_on:
-      api:
-        condition: service_healthy
+      - ${HOST_DOWNLOADS_DIR:-./data/downloads}:/data/downloads
+      - ${HOST_COOKIES_DIR:-./data/cookies}:/data/cookies
     networks:
       - mediavault-net
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
 
   cloudflared:
     image: cloudflare/cloudflared:latest
@@ -147,7 +85,7 @@ services:
       - tunnel
     restart: unless-stopped
     # In Cloudflare Zero Trust Dashboard -> Networks -> Tunnels -> Public Hostname,
-    # configure the Service URL to point to the internal Docker origin: http://client:3000
+    # configure the Service URL to point to the internal Docker origin: http://mediavault:3000
     command: ["tunnel", "--no-autoupdate", "run"]
     env_file:
       - path: .env
@@ -155,7 +93,8 @@ services:
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
     depends_on:
-      - client
+      mediavault:
+        condition: service_healthy
     networks:
       - mediavault-net
 
