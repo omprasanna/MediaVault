@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+.agent
+data
+docs
+scripts
+README.md
+docker-compose*.yml
+**/node_modules
+**/.next
+**/tsconfig.tsbuildinfo
+**/*.log
+server/test

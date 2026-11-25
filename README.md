@@ -32,11 +32,18 @@ MediaVault runs inside a dedicated Docker network (`mediavault-net`) composed of
 
 2. Start the stack:
 
+   - **Single-image Docker Hub deployment (Recommended for self-hosters — no build required):**
+     Runs the unified Alpine image [`omprasannasahoo181/mediavault:latest`](https://hub.docker.com/r/omprasannasahoo181/mediavault) (`api` + `worker` + Next.js `client` in one container) alongside MongoDB and Redis via [docker-compose.hub.yml](./docker-compose.hub.yml):
+     ```powershell
+     docker compose -f docker-compose.hub.yml pull
+     docker compose -f docker-compose.hub.yml up -d
+     ```
+     *(If using Cloudflare Tunnel with `docker-compose.hub.yml`, point your tunnel's Public Hostname service URL to `http://mediavault:3000`.)*
    - **Local development** (with source hot reload):
      ```powershell
      docker compose up -d --build
      ```
-   - **Daily production mode** (Next.js `standalone` build + `unless-stopped` restarts):
+   - **Daily source-built production mode** (Next.js `standalone` build + `unless-stopped` restarts):
      ```powershell
      docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
      ```

@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { buildInspectArgs, validateMediaUrl } = require('../src/utils/ytdlp');
-const { assertPublicUrl, isPrivateIp } = require('../src/utils/ssrf');
+const { assertPublicUrl, isPrivateIp, resolvePublicUrl } = require('../src/utils/ssrf');
 const { mapInspectResponse, sanitizeFilename } = require('../src/utils/formatMapper');
 const {
   buildYtDlpJobArgs,
@@ -517,4 +517,59 @@ test('formatMapper and workerHelpers handle portrait <=1080p HLS streams, omitte
     enforce1080pSelector('hls-720@60+hls-0_aac_q2-English', 'video', 'mp4'),
     'hls-720@60+hls-0_aac_q2-English'
   );
+});
+
+test('resolvePublicUrl falls back to c-ares resolve4/resolve6 on EAI_AGAIN while still blocking private IPs', async () => {
+  const eaiAgain = Object.assign(new Error('getaddrinfo EAI_AGAIN cdn.example.com'), {
+    code: 'EAI_AGAIN',
+  });
+  const eTimeout = Object.assign(new Error('queryAaaa ETIMEOUT cdn.example.com'), {
+    code: 'ETIMEOUT',
+  });
+  const eNotFound = Object.assign(new Error('getaddrinfo ENOTFOUND cdn.example.com'), {
+    code: 'ENOTFOUND',
+  });
+
+  const resolved = await resolvePublicUrl('https://cdn.example.com/video.mp4', {
+    allowFallback: true,
+    lookup: async () => {
+      throw eaiAgain;
+    },
+    resolve4: async () => ['54.192.151.51'],
+    resolve6: async () => {
+      throw eTimeout;
+    },
+  });
+  assert.deepEqual(resolved.addresses, [{ address: '54.192.151.51', family: 4 }]);
+
+  await assert.rejects(
+    () =>
+      resolvePublicUrl('https://cdn.example.com/video.mp4', {
+        allowFallback: true,
+        lookup: async () => {
+          throw eaiAgain;
+        },
+        resolve4: async () => ['54.192.151.51'],
+        resolve6: async () => ['::1'],
+      }),
+    { code: 'INVALID_URL' }
+  );
+
+  let resolve4Called = false;
+  await assert.rejects(
+    () =>
+      resolvePublicUrl('https://cdn.example.com/video.mp4', {
+        allowFallback: true,
+        lookup: async () => {
+          throw eNotFound;
+        },
+        resolve4: async () => {
+          resolve4Called = true;
+          return ['54.192.151.51'];
+        },
+        resolve6: async () => [],
+      }),
+    { code: 'INVALID_URL' }
+  );
+  assert.equal(resolve4Called, false);
 });

@@ -289,12 +289,86 @@ function validatePublicUrlSyntax(rawUrl) {
   };
 }
 
+const TRANSIENT_DNS_ERROR_CODES = new Set([
+  'EAI_AGAIN',
+  'EAI_FAIL',
+  'ETIMEOUT',
+  'ETIMEDOUT',
+  'ESERVFAIL',
+  'EREFUSED',
+]);
+
+/**
+ * Resolves DNS records for `hostname`, falling back to c-ares resolve4/resolve6
+ * and IPv4-only lookup on transient musl/Docker DNS failures (e.g. slow AAAA causing
+ * EAI_AGAIN). Custom `options.lookup` overrides rethrow unless `options.allowFallback`
+ * is explicitly set.
+ *
+ * @param {string} hostname
+ * @param {{
+ *   lookup?: typeof dns.promises.lookup,
+ *   resolve4?: typeof dns.promises.resolve4,
+ *   resolve6?: typeof dns.promises.resolve6,
+ *   allowFallback?: boolean,
+ * }} [options]
+ * @returns {Promise<Array<{ address: string, family: number }>>}
+ */
+async function resolveHostRecords(hostname, options = {}) {
+  const lookupFn = options.lookup || dns.promises.lookup;
+  try {
+    return await lookupFn(hostname, { all: true, verbatim: true });
+  } catch (err) {
+    if (options.lookup && !options.allowFallback) {
+      throw err;
+    }
+
+    const code = err && typeof err.code === 'string' ? err.code : '';
+    if (!TRANSIENT_DNS_ERROR_CODES.has(code)) {
+      throw err;
+    }
+
+    const resolve4Fn = options.resolve4 || dns.promises.resolve4;
+    const resolve6Fn = options.resolve6 || dns.promises.resolve6;
+    const [v4Result, v6Result] = await Promise.allSettled([
+      resolve4Fn(hostname),
+      resolve6Fn(hostname),
+    ]);
+
+    const combined = [];
+    if (v4Result.status === 'fulfilled' && Array.isArray(v4Result.value)) {
+      for (const ip of v4Result.value) {
+        if (typeof ip === 'string' && ip.trim()) {
+          combined.push({ address: ip.trim(), family: 4 });
+        }
+      }
+    }
+    if (v6Result.status === 'fulfilled' && Array.isArray(v6Result.value)) {
+      for (const ip of v6Result.value) {
+        if (typeof ip === 'string' && ip.trim()) {
+          combined.push({ address: ip.trim(), family: 6 });
+        }
+      }
+    }
+
+    if (combined.length > 0) {
+      return combined;
+    }
+
+    return lookupFn(hostname, { family: 4, all: true, verbatim: true });
+  }
+}
+
 /**
  * Validates that a URL uses HTTP(S), has no embedded credentials, resolves via DNS
  * (once), and returns the parsed URL along with validated public IP records.
  *
  * @param {string} rawUrl
- * @param {{ lookup?: typeof dns.promises.lookup }} [options]
+ * @param {{
+ *   lookup?: typeof dns.promises.lookup,
+ *   resolve4?: typeof dns.promises.resolve4,
+ *   resolve6?: typeof dns.promises.resolve6,
+ *   allowFallback?: boolean,
+ * }} [options]
  * @returns {Promise<{ url: URL, hostname: string, addresses: Array<{ address: string, family: number }> }>}
  */
 async function resolvePublicUrl(rawUrl, options = {}) {
@@ -316,10 +390,9 @@ async function resolvePublicUrl(rawUrl, options = {}) {
     };
   }
 
-  const lookupFn = options.lookup || dns.promises.lookup;
   let records;
   try {
-    records = await lookupFn(hostname, { all: true, verbatim: true });
+    records = await resolveHostRecords(hostname, options);
   } catch {
     throw new AppError(400, 'INVALID_URL', 'Unable to resolve target hostname.');
   }
