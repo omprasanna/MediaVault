@@ -69,6 +69,7 @@ function serializeJobSummary(job) {
     errorMessage: job.errorMessage || null,
     fileName: job.fileName || null,
     fileSizeBytes: job.fileSizeBytes || 0,
+    totalSizeBytes: job.totalSizeBytes || job.fileSizeBytes || 0,
     expiresAt: job.expiresAt || null,
     createdAt: job.createdAt,
   };
@@ -214,6 +215,14 @@ router.post('/', async (req, res, next) => {
         rawContainer
       );
 
+      const rawEstimatedSize = Number(
+        rawItem.estimatedSizeBytes ?? rawItem.totalSizeBytes ?? rawItem.filesize
+      );
+      const estimatedSizeBytes =
+        Number.isFinite(rawEstimatedSize) && rawEstimatedSize > 0
+          ? Math.round(rawEstimatedSize)
+          : 0;
+
       normalizedItems.push({
         sourceUrl: validated.url,
         platform: validated.platform,
@@ -232,6 +241,7 @@ router.post('/', async (req, res, next) => {
         container: rawContainer,
         formatSelector,
         useCookies,
+        totalSizeBytes: estimatedSizeBytes,
       });
     }
 
@@ -403,6 +413,10 @@ router.get('/', async (req, res, next) => {
               : serialized.progress,
           downloadSpeed: cached.downloadSpeed ?? serialized.downloadSpeed,
           eta: cached.eta ?? serialized.eta,
+          totalSizeBytes: Math.max(
+            serialized.totalSizeBytes || 0,
+            cached.totalSizeBytes || 0
+          ),
         };
       })
     );
@@ -991,6 +1005,7 @@ router.get('/:id', async (req, res, next) => {
     }
 
     let { status, progress, downloadSpeed, eta } = job;
+    let totalSizeBytes = job.totalSizeBytes || job.fileSizeBytes || 0;
 
     if (ACTIVE_STATUSES.has(status)) {
       const cached = await getJobProgressCache(id).catch(() => null);
@@ -1003,6 +1018,9 @@ router.get('/:id', async (req, res, next) => {
         }
         downloadSpeed = cached.downloadSpeed ?? downloadSpeed;
         eta = cached.eta ?? eta;
+        if (typeof cached.totalSizeBytes === 'number' && Number.isFinite(cached.totalSizeBytes)) {
+          totalSizeBytes = Math.max(totalSizeBytes, cached.totalSizeBytes);
+        }
       }
     }
 
@@ -1020,6 +1038,7 @@ router.get('/:id', async (req, res, next) => {
       mode: job.mode,
       fileName: job.fileName || null,
       fileSizeBytes: job.fileSizeBytes || 0,
+      totalSizeBytes,
       expiresAt: job.expiresAt || null,
       createdAt: job.createdAt,
     });

@@ -26,6 +26,7 @@ const {
   detectMuxingPhase,
   moveToUniquePath,
   parseDownloadTtlMinutes,
+  parseHumanSizeToBytes,
   parseYtDlpProgressLine,
   sanitizeFolderName,
 } = require('./utils/workerHelpers');
@@ -300,16 +301,30 @@ function runYtDlpDownload({
 
     resetStallTimer();
 
+    let streamIndex = 0;
+    let sawStreamProgress = false;
+
     const processLine = (line) => {
       const trimmed = line.trim();
       if (!trimmed) return;
+      if (
+        /^\[download\]\s+Destination:/i.test(trimmed) ||
+        /^\[download\]\s+.+\s+has already been downloaded/i.test(trimmed)
+      ) {
+        if (sawStreamProgress) {
+          streamIndex += 1;
+          sawStreamProgress = false;
+        }
+        return;
+      }
       if (detectMuxingPhase(trimmed)) {
         onMuxing();
         return;
       }
       const parsed = parseYtDlpProgressLine(trimmed);
       if (parsed) {
-        onProgress(parsed);
+        sawStreamProgress = true;
+        onProgress({ ...parsed, streamIndex });
       }
     };
 
@@ -383,6 +398,10 @@ async function processJob(bullJob, deps) {
   let currentStatus = 'downloading';
   let maxProgress = Math.min(94, Math.max(0, Number(job.progress || 0)));
   let lastDbProgress = maxProgress;
+  let knownTotalSizeBytes = Math.max(0, Number(job.totalSizeBytes || job.fileSizeBytes || 0));
+  let lastDbTotalSizeBytes = knownTotalSizeBytes;
+  let lastCacheTotalSizeBytes = knownTotalSizeBytes;
+  const streamSizeBytes = new Map();
   let lastDbWriteMs = 0;
   let lastCacheWriteMs = 0;
   let reachedMuxingPhase = false;
@@ -409,7 +428,13 @@ async function processJob(bullJob, deps) {
   });
 
   const publishProgress = async (
-    { status, progress, downloadSpeed = null, eta = null },
+    {
+      status,
+      progress,
+      downloadSpeed = null,
+      eta = null,
+      totalSizeBytes = knownTotalSizeBytes,
+    },
     forceDb = false
   ) => {
     if (pausedByRequest || cancelledForRetry || cancelledByRequest) {
@@ -420,30 +445,40 @@ async function processJob(bullJob, deps) {
     const statusChanged = status !== currentStatus;
     currentStatus = status;
     maxProgress = Math.max(maxProgress, progress);
+    if (Number.isFinite(totalSizeBytes) && totalSizeBytes > knownTotalSizeBytes) {
+      knownTotalSizeBytes = Math.round(totalSizeBytes);
+    }
+    const sizeChangedSinceCache = knownTotalSizeBytes !== lastCacheTotalSizeBytes;
+    const sizeChangedSinceDb = knownTotalSizeBytes !== lastDbTotalSizeBytes;
 
-    if (forceDb || statusChanged || now - lastCacheWriteMs >= 400) {
+    if (forceDb || statusChanged || sizeChangedSinceCache || now - lastCacheWriteMs >= 400) {
       lastCacheWriteMs = now;
+      lastCacheTotalSizeBytes = knownTotalSizeBytes;
       await mediaQueue.setJobProgressCache(jobId, {
         status: currentStatus,
         progress: maxProgress,
         downloadSpeed,
         eta,
+        totalSizeBytes: knownTotalSizeBytes,
       }).catch(() => {});
     }
 
     if (
       forceDb ||
       statusChanged ||
+      sizeChangedSinceDb ||
       maxProgress - lastDbProgress >= 2 ||
       now - lastDbWriteMs >= 1000
     ) {
       lastDbProgress = maxProgress;
+      lastDbTotalSizeBytes = knownTotalSizeBytes;
       lastDbWriteMs = now;
       await Job.findByIdAndUpdate(jobId, {
         status: currentStatus,
         progress: maxProgress,
         downloadSpeed,
         eta,
+        totalSizeBytes: knownTotalSizeBytes,
       }).catch(() => {});
     }
   };
@@ -454,6 +489,7 @@ async function processJob(bullJob, deps) {
       progress: maxProgress,
       downloadSpeed: null,
       eta: null,
+      totalSizeBytes: knownTotalSizeBytes,
       errorMessage: null,
     }).catch(() => {});
     await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
@@ -539,19 +575,37 @@ async function processJob(bullJob, deps) {
             controller.stop('paused');
           }
         },
-        onProgress: ({ percentage, downloadSpeed, eta }) => {
+        onProgress: ({ percentage, totalSize, downloadSpeed, eta, streamIndex = 0 }) => {
+          const parsedBytes = parseHumanSizeToBytes(totalSize);
+          if (parsedBytes > 0) {
+            streamSizeBytes.set(streamIndex, parsedBytes);
+            let summed = 0;
+            for (const size of streamSizeBytes.values()) {
+              summed += size;
+            }
+            if (summed > knownTotalSizeBytes) {
+              knownTotalSizeBytes = summed;
+            }
+          }
           const scaled = Math.min(94, Math.floor(percentage * 0.94));
           void publishProgress({
             status: currentStatus === 'muxing' ? 'muxing' : 'downloading',
             progress: scaled,
             downloadSpeed,
             eta,
+            totalSizeBytes: knownTotalSizeBytes,
           });
         },
         onMuxing: () => {
           reachedMuxingPhase = true;
           void publishProgress(
-            { status: 'muxing', progress: 95, downloadSpeed: null, eta: null },
+            {
+              status: 'muxing',
+              progress: 95,
+              downloadSpeed: null,
+              eta: null,
+              totalSizeBytes: knownTotalSizeBytes,
+            },
             true
           );
         },
@@ -598,8 +652,15 @@ async function processJob(bullJob, deps) {
       reachedMuxingPhase = false;
       maxProgress = 0;
       lastDbProgress = 0;
+      streamSizeBytes.clear();
       await publishProgress(
-        { status: 'downloading', progress: 0, downloadSpeed: null, eta: null },
+        {
+          status: 'downloading',
+          progress: 0,
+          downloadSpeed: null,
+          eta: null,
+          totalSizeBytes: knownTotalSizeBytes,
+        },
         true
       );
       await executeDownload('mkv');
@@ -659,6 +720,7 @@ async function processJob(bullJob, deps) {
       filePath: moved.filePath,
       fileName: moved.fileName,
       fileSizeBytes: stats.size,
+      totalSizeBytes: stats.size,
       errorMessage: null,
       expiresAt,
     });
@@ -693,6 +755,7 @@ async function processJob(bullJob, deps) {
       progress: maxProgress,
       downloadSpeed: null,
       eta: null,
+      totalSizeBytes: knownTotalSizeBytes,
       errorMessage: err.message || 'Download job failed.',
     }).catch(() => {});
     await mediaQueue.clearJobProgressCache(jobId).catch(() => {});

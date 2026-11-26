@@ -137,6 +137,57 @@ function derivePlatformSlug(hostname) {
 }
 
 /**
+ * Canonicalizes a user-supplied platform preset, hostname, or URL host into a safe
+ * storage slug (`youtube`, `hotstar.com`, etc.), rejecting restricted or unsafe names.
+ *
+ * @param {string} rawPlatform
+ * @returns {string | null}
+ */
+function canonicalizePlatformSlug(rawPlatform) {
+  if (typeof rawPlatform !== 'string') {
+    return null;
+  }
+
+  let candidate = rawPlatform.trim().toLowerCase();
+  if (!candidate) {
+    return null;
+  }
+
+  if (candidate.startsWith('http://') || candidate.startsWith('https://')) {
+    try {
+      candidate = new URL(candidate).hostname.toLowerCase();
+    } catch {
+      return null;
+    }
+  } else {
+    candidate = candidate.split('/')[0].split('?')[0].split('#')[0];
+  }
+
+  candidate = candidate.replace(/:\d+$/, '').replace(/^\[(.*)\]$/, '$1').replace(/\.+$/, '');
+  if (
+    !candidate ||
+    RESTRICTED_HOSTNAMES.has(candidate) ||
+    candidate.endsWith('.localhost') ||
+    candidate.endsWith('.local') ||
+    candidate.endsWith('.internal') ||
+    !isValidPlatformSlug(candidate)
+  ) {
+    return null;
+  }
+
+  if (HOST_PLATFORM_MAP[candidate]) {
+    return HOST_PLATFORM_MAP[candidate];
+  }
+
+  if (candidate.includes('.')) {
+    const derived = derivePlatformSlug(candidate);
+    return derived !== 'unknown' && isValidPlatformSlug(derived) ? derived : null;
+  }
+
+  return candidate;
+}
+
+/**
  * Validates and normalizes a media URL. Any public HTTP(S) URL supported by the
  * installed yt-dlp build is accepted; private, loopback, and credential-bearing
  * URLs are rejected up front, with full DNS/SSRF validation performed downstream.
@@ -241,7 +292,7 @@ async function resolveCookieFile(platform) {
     throw new AppError(
       400,
       'COOKIE_NOT_FOUND',
-      `No cookies file uploaded for platform "${platform}".`
+      `No cookies uploaded for "${platform}". Upload a Netscape cookies.txt for "${platform}" in Settings → Platform Cookies ("Add cookies for any site"), then retry with "Use saved cookies" enabled.`
     );
   }
 
@@ -525,6 +576,7 @@ module.exports = {
   HOST_PLATFORM_MAP,
   isValidPlatformSlug,
   derivePlatformSlug,
+  canonicalizePlatformSlug,
   validateMediaUrl,
   isPlaylistOnlyUrl,
   resolveCookieFile,

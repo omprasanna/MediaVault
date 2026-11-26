@@ -233,6 +233,7 @@ export function MediaInspectorCard({
               mode: selectedFormat.mode,
               container: selectedFormat.container,
               formatSelector: selectedFormat.formatSelector,
+              estimatedSizeBytes: selectedFormat.filesize,
               useCookies,
             },
           ],

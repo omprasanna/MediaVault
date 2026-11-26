@@ -212,7 +212,7 @@ async function requeueMediaJobsBulk(jobDocs) {
  * Stores volatile live progress updates in Redis to minimize MongoDB write load.
  *
  * @param {string} jobId
- * @param {{ status?: string, progress?: number, downloadSpeed?: string | null, eta?: string | null }} payload
+ * @param {{ status?: string, progress?: number, downloadSpeed?: string | null, eta?: string | null, totalSizeBytes?: number }} payload
  */
 async function setJobProgressCache(jobId, payload) {
   const redis = getProgressRedis();
@@ -222,6 +222,7 @@ async function setJobProgressCache(jobId, payload) {
     progress: String(Number(payload.progress ?? 0)),
     downloadSpeed: payload.downloadSpeed ? String(payload.downloadSpeed) : '',
     eta: payload.eta ? String(payload.eta) : '',
+    totalSizeBytes: String(Math.max(0, Math.round(Number(payload.totalSizeBytes || 0)))),
   };
   await redis.hset(key, fields);
   await redis.expire(key, PROGRESS_TTL_SECONDS);
@@ -243,6 +244,7 @@ async function getJobProgressCache(jobId) {
     progress: data.progress !== undefined ? Number(data.progress) : null,
     downloadSpeed: data.downloadSpeed || null,
     eta: data.eta || null,
+    totalSizeBytes: data.totalSizeBytes !== undefined ? Number(data.totalSizeBytes) || 0 : 0,
   };
 }
 

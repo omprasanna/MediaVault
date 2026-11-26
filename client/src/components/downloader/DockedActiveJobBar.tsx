@@ -6,6 +6,7 @@ import useSWR from 'swr';
 import { ArrowRight, CheckCircle2, Download, X } from 'lucide-react';
 import {
   ACTIVE_JOB_STATUSES,
+  formatBytes,
   type JobDetail,
   type JobSummary,
 } from '@/lib/mediaTypes';
@@ -132,6 +133,7 @@ export function DockedActiveJobBar({
             </p>
             <p className="font-mono text-[11px] text-ready">
               Ready for download · {readyJob.container.toUpperCase()}
+              {readyJob.fileSizeBytes > 0 ? ` · ${formatBytes(readyJob.fileSizeBytes)}` : ''}
             </p>
           </div>
         </div>
@@ -166,6 +168,9 @@ export function DockedActiveJobBar({
   }
 
   const displayJob = primaryDetail || activeJobs[0];
+  const activeSizeBytes =
+    displayJob.fileSizeBytes > 0 ? displayJob.fileSizeBytes : displayJob.totalSizeBytes || 0;
+  const formattedActiveSize = activeSizeBytes > 0 ? formatBytes(activeSizeBytes) : null;
   const progressValue = Math.min(
     100,
     Math.max(0, Math.round(displayJob.progress || 0))
@@ -202,6 +207,7 @@ export function DockedActiveJobBar({
         <div className="flex items-center justify-between gap-2 sm:justify-start">
           <span className="font-mono text-[11px] font-medium tabular-nums text-muxing">
             {statusLabel} · {progressValue}%
+            {formattedActiveSize ? ` · ${formattedActiveSize}` : ''}
           </span>
           {primaryDetail?.downloadSpeed && (
             <span className="font-mono text-[11px] tabular-nums text-ink-muted sm:hidden">

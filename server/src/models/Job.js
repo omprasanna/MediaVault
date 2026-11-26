@@ -86,6 +86,10 @@ const jobSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    totalSizeBytes: {
+      type: Number,
+      default: 0,
+    },
     errorMessage: {
       type: String,
       default: null,

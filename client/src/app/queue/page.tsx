@@ -710,6 +710,13 @@ export default function QueuePage() {
             const progressPercent = Math.min(100, Math.max(0, Math.round(job.progress || 0)));
             const containerSpec =
               job.mode === 'audio' ? '320K MP3' : job.container.toUpperCase();
+            const effectiveSizeBytes =
+              job.fileSizeBytes > 0 ? job.fileSizeBytes : job.totalSizeBytes || 0;
+            const formattedTotalSize =
+              effectiveSizeBytes > 0 ? formatBytes(effectiveSizeBytes) : null;
+            const containerWithSize = formattedTotalSize
+              ? `${containerSpec} · ${formattedTotalSize}`
+              : containerSpec;
 
             return (
               <article
@@ -762,8 +769,11 @@ export default function QueuePage() {
                         {job.title}
                       </h2>
                       <div className="flex shrink-0 items-center gap-2">
-                        <span className="rounded border border-border-default bg-surface px-2 py-0.5 font-mono text-[11px] tabular-nums text-ink-secondary">
-                          {containerSpec}
+                        <span
+                          data-testid={`job-size-badge-${job.id}`}
+                          className="rounded border border-border-default bg-surface px-2 py-0.5 font-mono text-[11px] tabular-nums text-ink-secondary"
+                        >
+                          {containerWithSize}
                         </span>
                         <span className="font-mono text-[11px] uppercase text-ink-muted">
                           {job.status === 'queued' ? 'Queued' : 'Downloading'}
@@ -830,8 +840,12 @@ export default function QueuePage() {
                     />
 
                     <div className="flex items-center justify-between gap-2 font-mono text-[11px] tabular-nums">
-                      <span className="font-medium text-accent-text">
+                      <span
+                        data-testid={`job-progress-meta-${job.id}`}
+                        className="font-medium text-accent-text"
+                      >
                         {progressPercent}%
+                        {formattedTotalSize ? ` of ${formattedTotalSize}` : ''}
                         {job.downloadSpeed ? ` · ${job.downloadSpeed}` : ''}
                       </span>
                       <span className="text-ink-muted">
@@ -851,8 +865,11 @@ export default function QueuePage() {
                         {job.title}
                       </h2>
                       <div className="flex shrink-0 items-center gap-2">
-                        <span className="rounded border border-border-default bg-surface px-2 py-0.5 font-mono text-[11px] tabular-nums text-ink-secondary">
-                          {containerSpec}
+                        <span
+                          data-testid={`job-size-badge-${job.id}`}
+                          className="rounded border border-border-default bg-surface px-2 py-0.5 font-mono text-[11px] tabular-nums text-ink-secondary"
+                        >
+                          {containerWithSize}
                         </span>
                         <span className="rounded border border-muxing-border bg-muxing-bg px-2 py-0.5 font-mono text-[11px] font-medium uppercase text-muxing">
                           Fast Muxing
@@ -884,8 +901,11 @@ export default function QueuePage() {
                         {job.title}
                       </h2>
                       <div className="flex shrink-0 items-center gap-2">
-                        <span className="rounded border border-border-default bg-surface px-2 py-0.5 font-mono text-[11px] tabular-nums text-ink-secondary">
-                          {containerSpec}
+                        <span
+                          data-testid={`job-size-badge-${job.id}`}
+                          className="rounded border border-border-default bg-surface px-2 py-0.5 font-mono text-[11px] tabular-nums text-ink-secondary"
+                        >
+                          {containerWithSize}
                         </span>
                         <span className="rounded border border-muxing-border bg-muxing-bg px-2 py-0.5 font-mono text-[11px] font-medium uppercase text-muxing">
                           Paused
@@ -930,8 +950,11 @@ export default function QueuePage() {
                     />
 
                     <div className="flex items-center justify-between gap-2 font-mono text-[11px] tabular-nums">
-                      <span className="font-medium text-muxing">
-                        {progressPercent}% · Paused — resumes from partial file
+                      <span
+                        data-testid={`job-progress-meta-${job.id}`}
+                        className="font-medium text-muxing"
+                      >
+                        {progressPercent}%{formattedTotalSize ? ` of ${formattedTotalSize}` : ''} · Paused — resumes from partial file
                       </span>
                       <span className="text-ink-muted">
                         {formatPlatformLabel(job.platform, job.sourceUrl)}
@@ -948,7 +971,10 @@ export default function QueuePage() {
                         {job.title}
                       </h2>
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="rounded border border-border-default bg-surface px-2 py-0.5 font-mono text-[11px] tabular-nums text-ink-secondary">
+                        <span
+                          data-testid={`job-size-badge-${job.id}`}
+                          className="rounded border border-border-default bg-surface px-2 py-0.5 font-mono text-[11px] tabular-nums text-ink-secondary"
+                        >
                           {job.container.toUpperCase()} · {formatBytes(job.fileSizeBytes)}
                         </span>
                         <span className="rounded border border-ready-border bg-ready-bg px-2 py-0.5 font-mono text-[11px] font-medium uppercase text-ready">
@@ -1003,6 +1029,14 @@ export default function QueuePage() {
                         <h2 className="min-w-0 truncate text-sm font-semibold text-ink-primary">
                           {job.title}
                         </h2>
+                        {formattedTotalSize && (
+                          <span
+                            data-testid={`job-size-badge-${job.id}`}
+                            className="shrink-0 rounded border border-border-default bg-surface px-2 py-0.5 font-mono text-[11px] tabular-nums text-ink-secondary"
+                          >
+                            {containerWithSize}
+                          </span>
+                        )}
                         <span className="shrink-0 rounded border border-failed-border bg-failed-bg px-2 py-0.5 font-mono text-[11px] font-medium uppercase text-failed">
                           {isAuthRelatedError(job.errorMessage)
                             ? 'Auth Required'

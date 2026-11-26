@@ -12,7 +12,11 @@ import {
   Search,
   X,
 } from 'lucide-react';
-import { SUPPORTED_PLATFORMS, SUPPORTED_PROVIDER_COUNT } from '@/lib/mediaTypes';
+import {
+  SUPPORTED_PLATFORMS,
+  SUPPORTED_PROVIDER_COUNT,
+  deriveCookiePlatformSlug,
+} from '@/lib/mediaTypes';
 
 interface UrlInputCardProps {
   variant: 'hero' | 'compact';
@@ -41,7 +45,23 @@ function isValidHttpUrl(candidate: string): boolean {
 
 function isAuthOrAgeError(message: string | null | undefined): boolean {
   if (!message) return false;
-  return /age|cookie|sign\s?in|auth|private|login|members?|bot|403/i.test(message);
+  return /age|cookie|sign\s?in|auth|private|login|registered|members?|bot|403/i.test(message);
+}
+
+function CookieHelpLink({ url }: { url: string }) {
+  const slug = deriveCookiePlatformSlug(url);
+  const href = slug
+    ? `/settings?cookieSite=${encodeURIComponent(slug)}#cookie-upload`
+    : '/settings#age-restricted-guide';
+  return (
+    <Link
+      href={href}
+      data-testid="error-age-restricted-guide-link"
+      className="ml-1.5 font-semibold underline underline-offset-2 hover:opacity-90"
+    >
+      {slug ? `Upload cookies for ${slug} →` : 'See age-restricted video guide →'}
+    </Link>
+  );
 }
 
 export function UrlInputCard({
@@ -290,15 +310,7 @@ export function UrlInputCard({
               <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
               <span>
                 <strong className="font-semibold">Error:</strong> {displayError}
-                {isAuthOrAgeError(displayError) && (
-                  <Link
-                    href="/settings#age-restricted-guide"
-                    data-testid="error-age-restricted-guide-link"
-                    className="ml-1.5 font-semibold underline underline-offset-2 hover:opacity-90"
-                  >
-                    See age-restricted video guide →
-                  </Link>
-                )}
+                {isAuthOrAgeError(displayError) && <CookieHelpLink url={url} />}
               </span>
             </div>
           )}
@@ -398,15 +410,7 @@ export function UrlInputCard({
             <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
             <span>
               <strong className="font-semibold">Error:</strong> {displayError}
-              {isAuthOrAgeError(displayError) && (
-                <Link
-                  href="/settings#age-restricted-guide"
-                  data-testid="error-age-restricted-guide-link"
-                  className="ml-1.5 font-semibold underline underline-offset-2 hover:opacity-90"
-                >
-                  See age-restricted video guide →
-                </Link>
-              )}
+              {isAuthOrAgeError(displayError) && <CookieHelpLink url={url} />}
             </span>
           </div>
         )}

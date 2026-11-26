@@ -143,6 +143,44 @@ function buildYtDlpJobArgs({
 const DOWNLOAD_PROGRESS_REGEX =
   /\[download\]\s+(\d+(?:\.\d+)?)%(?:\s+of\s+~?\s*([^\s]+))?(?:\s+at\s+([^\s]+))?(?:\s+ETA\s+([^\s]+))?/i;
 
+const SIZE_UNIT_MULTIPLIERS = {
+  b: 1,
+  kb: 1000,
+  kib: 1024,
+  mb: 1000 * 1000,
+  mib: 1024 * 1024,
+  gb: 1000 * 1000 * 1000,
+  gib: 1024 * 1024 * 1024,
+  tb: 1000 * 1000 * 1000 * 1000,
+  tib: 1024 * 1024 * 1024 * 1024,
+};
+
+/**
+ * Parses a human-readable yt-dlp size token (e.g. `~120.50MiB`, `1.4GiB`, `512B`) into integer bytes.
+ *
+ * @param {string | null | undefined} raw
+ * @returns {number}
+ */
+function parseHumanSizeToBytes(raw) {
+  if (typeof raw !== 'string') {
+    return 0;
+  }
+  const cleaned = raw.trim().replace(/^~\s*/, '');
+  if (!cleaned || /^(?:unknown|n\/a)$/i.test(cleaned)) {
+    return 0;
+  }
+  const match = cleaned.match(/^(\d+(?:\.\d+)?)\s*([a-z]{1,3})$/i);
+  if (!match) {
+    return 0;
+  }
+  const value = Number(match[1]);
+  const multiplier = SIZE_UNIT_MULTIPLIERS[match[2].toLowerCase()];
+  if (!Number.isFinite(value) || value <= 0 || !multiplier) {
+    return 0;
+  }
+  return Math.round(value * multiplier);
+}
+
 /**
  * Parses a single yt-dlp stdout line for download progress metrics.
  *
@@ -164,12 +202,14 @@ function parseYtDlpProgressLine(line) {
     return null;
   }
 
+  const rawTotalSize = match[2] || null;
   const rawSpeed = match[3] || null;
   const rawEta = match[4] || null;
 
   return {
     percentage,
-    totalSize: match[2] || null,
+    totalSize:
+      rawTotalSize && !/^(?:unknown|n\/a)$/i.test(rawTotalSize) ? rawTotalSize : null,
     downloadSpeed: rawSpeed && rawSpeed.toLowerCase() !== 'unknown' ? rawSpeed : null,
     eta: rawEta && rawEta.toLowerCase() !== 'unknown' ? rawEta : null,
   };
@@ -300,6 +340,7 @@ module.exports = {
   getDefaultFormatSelector,
   enforce1080pSelector,
   buildYtDlpJobArgs,
+  parseHumanSizeToBytes,
   parseYtDlpProgressLine,
   detectMuxingPhase,
   assertSufficientDiskSpace,

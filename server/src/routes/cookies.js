@@ -5,7 +5,7 @@ const path = require('path');
 const Cookie = require('../models/Cookie');
 const { MAX_COOKIE_BYTES, validateNetscapeCookies } = require('../utils/cookieValidator');
 const { AppError } = require('../utils/errors');
-const { ALLOWED_PLATFORMS, isValidPlatformSlug } = require('../utils/ytdlp');
+const { ALLOWED_PLATFORMS, canonicalizePlatformSlug, isValidPlatformSlug } = require('../utils/ytdlp');
 
 const router = express.Router();
 
@@ -22,8 +22,8 @@ function getCookiesDir() {
 }
 
 function validatePlatformParam(rawPlatform) {
-  const platform = String(rawPlatform || '').trim().toLowerCase();
-  if (!isValidPlatformSlug(platform)) {
+  const platform = canonicalizePlatformSlug(rawPlatform);
+  if (!platform) {
     throw new AppError(
       400,
       'INVALID_REQUEST',

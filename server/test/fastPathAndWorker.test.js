@@ -6,6 +6,7 @@ const path = require('node:path');
 
 const {
   buildInspectArgs,
+  canonicalizePlatformSlug,
   derivePlatformSlug,
   isValidPlatformSlug,
   validateMediaUrl,
@@ -18,6 +19,7 @@ const {
   enforce1080pSelector,
   moveToUniquePath,
   parseDownloadTtlMinutes,
+  parseHumanSizeToBytes,
   parseYtDlpProgressLine,
   sanitizeFolderName,
 } = require('../src/utils/workerHelpers');
@@ -87,6 +89,7 @@ test('derivePlatformSlug and isValidPlatformSlug keep cookie filenames safe', ()
   assert.equal(derivePlatformSlug('www.tiktok.com'), 'tiktok.com');
   assert.equal(derivePlatformSlug('player.vimeo.com'), 'vimeo.com');
   assert.equal(derivePlatformSlug('www.bbc.co.uk'), 'bbc.co.uk');
+  assert.equal(derivePlatformSlug('www.hotstar.com'), 'hotstar.com');
   assert.equal(derivePlatformSlug('127.0.0.1'), 'ip-127-0-0-1');
 
   for (const slug of ['youtube', 'tiktok.com', 'bbc.co.uk', 'ip-127-0-0-1']) {
@@ -616,4 +619,39 @@ test('resolvePublicUrl falls back to c-ares resolve4/resolve6 on EAI_AGAIN while
     { code: 'INVALID_URL' }
   );
   assert.equal(resolve4Called, false);
+});
+
+test('canonicalizePlatformSlug normalizes hosts, URLs, and aliases while rejecting unsafe targets', () => {
+  assert.equal(canonicalizePlatformSlug('www.hotstar.com'), 'hotstar.com');
+  assert.equal(canonicalizePlatformSlug('https://www.hotstar.com/in/movies/test/1260022902'), 'hotstar.com');
+  assert.equal(canonicalizePlatformSlug('hotstar.com'), 'hotstar.com');
+  assert.equal(canonicalizePlatformSlug('www.youtube.com'), 'youtube');
+  assert.equal(canonicalizePlatformSlug('twitter.com'), 'x');
+  assert.equal(canonicalizePlatformSlug('dai.ly'), 'dailymotion');
+  assert.equal(canonicalizePlatformSlug('www.bbc.co.uk'), 'bbc.co.uk');
+  assert.equal(canonicalizePlatformSlug('youtube'), 'youtube');
+  assert.equal(canonicalizePlatformSlug('localhost'), null);
+  assert.equal(canonicalizePlatformSlug('app.local'), null);
+  assert.equal(canonicalizePlatformSlug('internal.internal'), null);
+  assert.equal(canonicalizePlatformSlug('../etc/passwd'), null);
+  assert.equal(canonicalizePlatformSlug(''), null);
+});
+
+test('parseHumanSizeToBytes parses yt-dlp total sizes and sanitizes unknown tokens', () => {
+  assert.equal(parseHumanSizeToBytes('120.50MiB'), Math.round(120.5 * 1024 * 1024));
+  assert.equal(parseHumanSizeToBytes('~1.5GiB'), Math.round(1.5 * 1024 * 1024 * 1024));
+  assert.equal(parseHumanSizeToBytes('512KiB'), 512 * 1024);
+  assert.equal(parseHumanSizeToBytes('50MB'), 50 * 1000 * 1000);
+  assert.equal(parseHumanSizeToBytes('512B'), 512);
+  assert.equal(parseHumanSizeToBytes('Unknown'), 0);
+  assert.equal(parseHumanSizeToBytes('N/A'), 0);
+  assert.equal(parseHumanSizeToBytes(null), 0);
+
+  const parsedUnknown = parseYtDlpProgressLine('[download]  15.0% of Unknown at 1.2MiB/s ETA 00:10');
+  assert.deepEqual(parsedUnknown, {
+    percentage: 15,
+    totalSize: null,
+    downloadSpeed: '1.2MiB/s',
+    eta: '00:10',
+  });
 });

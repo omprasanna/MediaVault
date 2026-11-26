@@ -76,6 +76,7 @@ export interface JobSummary {
   errorMessage?: string | null;
   fileName: string | null;
   fileSizeBytes: number;
+  totalSizeBytes?: number;
   expiresAt: string | null;
   createdAt: string;
 }
@@ -103,7 +104,99 @@ export interface JobsPagination {
   hasMore: boolean;
 }
 
-export type CookiePlatform = 'youtube' | 'instagram' | 'facebook' | 'x' | 'dailymotion';
+/**
+ * Cookie platform identifier. Built-in platforms use short IDs (`youtube`, `x`, ...);
+ * every other yt-dlp supported site uses its registrable domain (e.g. `hotstar.com`).
+ */
+export type CookiePlatform = string;
+
+const COOKIE_HOST_ALIASES: Record<string, string> = {
+  'youtube.com': 'youtube',
+  'youtu.be': 'youtube',
+  'youtube-nocookie.com': 'youtube',
+  'instagram.com': 'instagram',
+  'instagr.am': 'instagram',
+  'facebook.com': 'facebook',
+  'fb.watch': 'facebook',
+  'fb.com': 'facebook',
+  'x.com': 'x',
+  'twitter.com': 'x',
+  'dailymotion.com': 'dailymotion',
+  'dai.ly': 'dailymotion',
+};
+
+const COOKIE_MULTI_PART_SUFFIXES = new Set([
+  'ac.uk',
+  'co.in',
+  'co.jp',
+  'co.kr',
+  'co.uk',
+  'co.za',
+  'com.au',
+  'com.br',
+  'com.cn',
+  'com.hk',
+  'com.mx',
+  'com.sg',
+  'com.tr',
+  'com.tw',
+  'gov.uk',
+  'net.au',
+  'org.au',
+  'org.uk',
+]);
+
+const COOKIE_SLUG_REGEX = /^[a-z0-9](?:[a-z0-9.-]{0,98}[a-z0-9])?$/;
+
+/**
+ * Derives the cookie file slug MediaVault uses for a site, mirroring the server's
+ * `derivePlatformSlug`. Accepts a full URL (`https://www.hotstar.com/in/...`) or a
+ * bare domain (`hotstar.com`). Returns `null` when the input is not a usable host.
+ */
+export function deriveCookiePlatformSlug(rawUrlOrHost: string): string | null {
+  const trimmed = String(rawUrlOrHost || '').trim().toLowerCase();
+  if (!trimmed) {
+    return null;
+  }
+
+  let hostname: string;
+  try {
+    const candidate = /^[a-z][a-z0-9+.-]*:\/\//.test(trimmed) ? trimmed : `https://${trimmed}`;
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null;
+    }
+    hostname = parsed.hostname;
+  } catch {
+    return null;
+  }
+
+  hostname = hostname.replace(/^\[(.*)\]$/, '$1').replace(/\.+$/, '');
+  if (
+    !hostname ||
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname.endsWith('.local') ||
+    hostname.endsWith('.internal')
+  ) {
+    return null;
+  }
+
+  const labels = hostname.split('.').filter(Boolean);
+  if (labels.length < 2 || labels.some((label) => !/^[a-z0-9-]+$/.test(label))) {
+    return null;
+  }
+
+  const lastTwo = labels.slice(-2).join('.');
+  const start = COOKIE_MULTI_PART_SUFFIXES.has(lastTwo) ? labels.length - 3 : labels.length - 2;
+  const registrable = labels.slice(Math.max(0, start)).join('.');
+  const slug = COOKIE_HOST_ALIASES[registrable] || registrable;
+
+  if (slug.includes('..') || !COOKIE_SLUG_REGEX.test(slug)) {
+    return null;
+  }
+  return slug;
+}
 
 export interface CookiePlatformStatus {
   platform: CookiePlatform;
@@ -351,6 +444,12 @@ const PLATFORM_LABELS: Record<string, string> = {
   'ted.com': 'TED',
   'bbc.co.uk': 'BBC',
   'cnn.com': 'CNN',
+  'hotstar.com': 'Hotstar',
+  'crunchyroll.com': 'Crunchyroll',
+  'patreon.com': 'Patreon',
+  'jiocinema.com': 'JioCinema',
+  'sonyliv.com': 'SonyLIV',
+  'zee5.com': 'ZEE5',
 };
 
 export function formatPlatformLabel(platform: string, sourceUrl?: string): string {

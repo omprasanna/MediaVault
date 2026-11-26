@@ -9,6 +9,7 @@ import {
   useState,
   type ChangeEvent,
   type DragEvent,
+  type FormEvent,
   type KeyboardEvent,
 } from 'react';
 import Link from 'next/link';
@@ -38,8 +39,10 @@ import {
   X,
 } from 'lucide-react';
 import {
+  deriveCookiePlatformSlug,
   extractApiError,
   formatBytes,
+  formatPlatformLabel,
   formatRelativeTime,
   type CookiePlatform,
   type CookiePlatformStatus,
@@ -74,6 +77,15 @@ const ALL_COOKIE_PLATFORMS: readonly { id: CookiePlatform; label: string }[] = [
 
 const MAX_COOKIE_BYTES = 512 * 1024;
 
+const BUILT_IN_COOKIE_IDS = new Set(ALL_COOKIE_PLATFORMS.map((p) => p.id));
+
+function getCookiePlatformLabel(platform: CookiePlatform): string {
+  return (
+    ALL_COOKIE_PLATFORMS.find((p) => p.id === platform)?.label ||
+    formatPlatformLabel(platform)
+  );
+}
+
 export default function SettingsPage() {
   const router = useRouter();
   const { cache, mutate } = useSWRConfig();
@@ -85,6 +97,15 @@ export default function SettingsPage() {
   const previousFocusRef = useRef<HTMLElement | null>(null);
 
   const dropzoneHeadingId = useId();
+  const customSiteInputId = useId();
+  const customSiteHintId = useId();
+  const customSiteErrorId = useId();
+  const customSiteInputRef = useRef<HTMLInputElement>(null);
+  const [customSite, setCustomSite] = useState<string>('');
+  const [customSiteTouched, setCustomSiteTouched] = useState<boolean>(false);
+  const customSiteSlug = useMemo(() => deriveCookiePlatformSlug(customSite), [customSite]);
+  const customSiteInvalid = customSiteTouched && customSite.trim().length > 0 && !customSiteSlug;
+  const customSiteEmptySubmit = customSiteTouched && customSite.trim().length === 0;
   const [mounted, setMounted] = useState<boolean>(false);
   const [signingOut, setSigningOut] = useState<boolean>(false);
 
@@ -227,10 +248,31 @@ export default function SettingsPage() {
     if (typeof window === 'undefined') {
       return;
     }
-    if (window.location.hash === '#age-restricted-guide') {
-      const target = document.getElementById('age-restricted-guide');
+    const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const cookieSiteParam = new URLSearchParams(window.location.search).get('cookieSite');
+    if (cookieSiteParam && cookieSiteParam.trim()) {
+      const slug = deriveCookiePlatformSlug(cookieSiteParam);
+      setCustomSite(slug || cookieSiteParam.trim());
+      setCustomSiteTouched(!slug);
+      if (slug) {
+        setTargetPlatform(slug);
+      }
+      const uploadSection = document.getElementById('cookie-upload');
+      if (uploadSection) {
+        requestAnimationFrame(() => {
+          uploadSection.scrollIntoView({
+            behavior: prefersReduced ? 'auto' : 'smooth',
+            block: 'start',
+          });
+          customSiteInputRef.current?.focus({ preventScroll: true });
+        });
+      }
+      return;
+    }
+    if (window.location.hash === '#cookie-upload' || window.location.hash === '#age-restricted-guide') {
+      const targetId = window.location.hash.slice(1);
+      const target = document.getElementById(targetId);
       if (target) {
-        const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
         requestAnimationFrame(() => {
           target.scrollIntoView({
             behavior: prefersReduced ? 'auto' : 'smooth',
@@ -249,8 +291,42 @@ export default function SettingsPage() {
     return map;
   }, [cookies]);
 
-  const targetPlatformLabel =
-    ALL_COOKIE_PLATFORMS.find((p) => p.id === targetPlatform)?.label || 'YouTube';
+  const installedCookieCount = useMemo(
+    () => cookies.filter((entry) => entry.installed).length,
+    [cookies]
+  );
+
+  const customInstalledCookies = useMemo(
+    () =>
+      cookies
+        .filter((entry) => entry.installed && !BUILT_IN_COOKIE_IDS.has(entry.platform))
+        .sort((a, b) => a.platform.localeCompare(b.platform)),
+    [cookies]
+  );
+
+  const extraInstalledCookies = useMemo(
+    () =>
+      cookies
+        .filter(
+          (entry) =>
+            entry.installed &&
+            !PRIMARY_COOKIE_PLATFORMS.some((p) => p.id === entry.platform)
+        )
+        .sort((a, b) => a.platform.localeCompare(b.platform)),
+    [cookies]
+  );
+
+  const targetPlatformLabel = getCookiePlatformLabel(targetPlatform);
+
+  function handleCustomSiteSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setCustomSiteTouched(true);
+    if (!customSiteSlug) {
+      customSiteInputRef.current?.focus();
+      return;
+    }
+    triggerUploadFor(customSiteSlug);
+  }
 
   function triggerUploadFor(platform: CookiePlatform) {
     setTargetPlatform(platform);
@@ -290,8 +366,7 @@ export default function SettingsPage() {
 
       const data = (await res.json()) as { cookieCount?: number };
       await Promise.all([mutateCookies(), mutateSystem()]);
-      const label =
-        ALL_COOKIE_PLATFORMS.find((p) => p.id === platform)?.label || platform;
+      const label = getCookiePlatformLabel(platform);
       showToast(
         `Saved ${label} cookies.txt (${data.cookieCount ?? 0} entries, 0600)`,
         'success'
@@ -366,8 +441,7 @@ export default function SettingsPage() {
       }
 
       await Promise.all([mutateCookies(), mutateSystem()]);
-      const label =
-        ALL_COOKIE_PLATFORMS.find((p) => p.id === platform)?.label || platform;
+      const label = getCookiePlatformLabel(platform);
       showToast(`Removed ${label} cookies.txt`, 'success');
     } catch {
       const msg = 'Network error deleting platform cookie file.';
@@ -393,8 +467,6 @@ export default function SettingsPage() {
     }
   }
 
-  const dailymotionStatus = cookieMap.get('dailymotion');
-
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-8 px-4 py-6 md:px-6 md:py-8">
       {/* Section 1: Platform Cookies (2x2 Grid) */}
@@ -407,12 +479,23 @@ export default function SettingsPage() {
             >
               Platform Cookies
             </h1>
-            <span className="rounded border border-border-default bg-surface px-2 py-0.5 font-mono text-[11px] tabular-nums text-ink-secondary">
-              4 Platforms
+            <span
+              data-testid="installed-cookie-count"
+              className="rounded border border-border-default bg-surface px-2 py-0.5 font-mono text-[11px] tabular-nums text-ink-secondary"
+            >
+              {installedCookieCount} installed · Any site
             </span>
           </div>
           <p className="text-[13px] text-ink-secondary">
             Stored locally in Docker volume (`0600`). Attached only when explicitly toggled on.
+            Need cookies for another site (Hotstar, Vimeo, Twitch...)? Use{' '}
+            <a
+              href="#cookie-upload"
+              className="font-medium text-accent-text underline underline-offset-4"
+            >
+              Add cookies for any site
+            </a>{' '}
+            below.
           </p>
         </div>
 
@@ -524,7 +607,11 @@ export default function SettingsPage() {
       </section>
 
       {/* Section 2: Upload Dropzone */}
-      <section aria-labelledby={dropzoneHeadingId} className="flex flex-col gap-4">
+      <section
+        id="cookie-upload"
+        aria-labelledby={dropzoneHeadingId}
+        className="scroll-mt-20 flex flex-col gap-4"
+      >
         <div className="flex items-center justify-between gap-2">
           <h2
             id={dropzoneHeadingId}
@@ -536,7 +623,7 @@ export default function SettingsPage() {
             data-testid="selected-cookie-target"
             className="font-mono text-xs font-medium text-accent-text"
           >
-            Target: {targetPlatformLabel}
+            Target: {targetPlatformLabel} ({targetPlatform}.txt)
           </span>
         </div>
 
@@ -636,7 +723,195 @@ export default function SettingsPage() {
             );
           })}
 
-          {dailymotionStatus?.installed && (
+          {extraInstalledCookies
+            .filter((entry) => !BUILT_IN_COOKIE_IDS.has(entry.platform))
+            .map((entry) => {
+              const active = targetPlatform === entry.platform;
+              return (
+                <button
+                  key={entry.platform}
+                  type="button"
+                  aria-pressed={active}
+                  data-testid={`platform-pill-${entry.platform}`}
+                  onClick={() => {
+                    setTargetPlatform(entry.platform);
+                    setUploadError(null);
+                  }}
+                  className={`mv-focus inline-flex cursor-pointer items-center gap-1.5 rounded-full border px-3 py-1.5 text-[13px] transition-colors ${
+                    active
+                      ? 'border-accent bg-accent font-semibold text-on-accent shadow-[var(--shadow-xs)]'
+                      : 'border-border-default bg-surface font-medium text-ink-secondary hover:bg-surface-high hover:text-ink-primary'
+                  }`}
+                >
+                  <span
+                    aria-hidden="true"
+                    className={`h-1.5 w-1.5 rounded-full ${active ? 'bg-on-accent' : 'bg-ready-dot'}`}
+                  />
+                  <span className="font-mono text-xs">{entry.platform}</span>
+                </button>
+              );
+            })}
+
+          {targetPlatform &&
+            !BUILT_IN_COOKIE_IDS.has(targetPlatform) &&
+            !cookieMap.get(targetPlatform)?.installed && (
+              <span
+                data-testid={`platform-pill-${targetPlatform}`}
+                className="inline-flex items-center gap-1.5 rounded-full border border-accent bg-accent px-3 py-1.5 font-mono text-xs font-semibold text-on-accent shadow-[var(--shadow-xs)]"
+              >
+                {targetPlatform}
+              </span>
+            )}
+        </div>
+
+        {/* Add cookies for any yt-dlp supported site */}
+        <form
+          onSubmit={handleCustomSiteSubmit}
+          noValidate
+          data-testid="custom-cookie-site-form"
+          className="flex flex-col gap-2 rounded-xl border border-border-default bg-surface p-4 shadow-[var(--shadow-xs)]"
+        >
+          <label
+            htmlFor={customSiteInputId}
+            className="text-[13px] font-semibold text-ink-primary"
+          >
+            Add cookies for any site
+          </label>
+          <p id={customSiteHintId} className="text-xs leading-relaxed text-ink-secondary">
+            Enter the site domain or paste the video URL that asked for cookies (for example{' '}
+            <code className="font-mono text-[11px]">hotstar.com</code> or{' '}
+            <code className="font-mono text-[11px]">https://www.hotstar.com/in/...</code>).
+            MediaVault saves it as <code className="font-mono text-[11px]">&lt;domain&gt;.txt</code>{' '}
+            and uses it automatically for every URL on that site.
+          </p>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <input
+              ref={customSiteInputRef}
+              id={customSiteInputId}
+              type="text"
+              inputMode="url"
+              value={customSite}
+              onChange={(event) => {
+                const nextValue = event.target.value;
+                setCustomSite(nextValue);
+                if (!nextValue.trim()) {
+                  setCustomSiteTouched(false);
+                } else {
+                  const nextSlug = deriveCookiePlatformSlug(nextValue);
+                  if (nextSlug) {
+                    setTargetPlatform(nextSlug);
+                  }
+                }
+                setUploadError(null);
+              }}
+              onBlur={() => {
+                if (customSite.trim()) {
+                  setCustomSiteTouched(true);
+                }
+              }}
+              autoComplete="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              enterKeyHint="go"
+              placeholder="hotstar.com"
+              aria-invalid={customSiteInvalid || customSiteEmptySubmit ? 'true' : 'false'}
+              aria-describedby={
+                customSiteInvalid || customSiteEmptySubmit
+                  ? `${customSiteHintId} ${customSiteErrorId}`
+                  : customSiteHintId
+              }
+              data-testid="custom-cookie-site-input"
+              className={`mv-focus h-9 min-w-0 flex-1 rounded-lg border bg-surface-recessed px-3 font-mono text-[13px] text-ink-primary placeholder:text-ink-placeholder focus:border-accent focus:outline-none ${
+                customSiteInvalid || customSiteEmptySubmit
+                  ? 'border-failed-border'
+                  : 'border-border-default'
+              }`}
+            />
+            <button
+              type="submit"
+              disabled={Boolean(uploadingPlatform)}
+              data-testid="custom-cookie-site-upload-btn"
+              className="mv-focus inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-accent px-3 text-[13px] font-semibold text-on-accent shadow-[var(--shadow-xs)] transition-colors hover:bg-accent-hover disabled:opacity-50"
+            >
+              <Upload className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>
+                {customSiteSlug ? `Upload cookies.txt for ${customSiteSlug}` : 'Upload cookies.txt'}
+              </span>
+            </button>
+          </div>
+          {(customSiteInvalid || customSiteEmptySubmit) && (
+            <p
+              id={customSiteErrorId}
+              className="flex items-start gap-1.5 text-xs text-failed"
+              data-testid="custom-cookie-site-error"
+            >
+              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-label="Error" role="img" />
+              <span>
+                {customSiteEmptySubmit
+                  ? 'Enter a site domain such as hotstar.com.'
+                  : 'Enter a valid domain such as hotstar.com or a full https:// URL.'}
+              </span>
+            </p>
+          )}
+        </form>
+
+        {customInstalledCookies.length > 0 && (
+          <div className="flex flex-col gap-2" data-testid="custom-cookie-list">
+            <h3 className="text-xs font-semibold uppercase tracking-[0.02em] text-ink-muted">
+              Saved site cookies
+            </h3>
+            <ul className="divide-y divide-border-subtle rounded-xl border border-border-default bg-surface shadow-[var(--shadow-xs)]">
+              {customInstalledCookies.map((entry) => {
+                const isBusy =
+                  uploadingPlatform === entry.platform || deletingPlatform === entry.platform;
+                return (
+                  <li
+                    key={entry.platform}
+                    data-testid={`custom-cookie-row-${entry.platform}`}
+                    className="flex flex-wrap items-center justify-between gap-2 px-3 py-2"
+                  >
+                    <div className="flex min-w-0 flex-col">
+                      <span className="truncate font-mono text-[13px] font-medium text-ink-primary">
+                        {entry.platform}
+                      </span>
+                      <span className="font-mono text-[11px] text-ink-muted">
+                        {entry.isValid === false
+                          ? 'Session validation failed'
+                          : formatRelativeTime(entry.updatedAt)}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={isBusy}
+                        onClick={() => triggerUploadFor(entry.platform)}
+                        data-testid={`replace-cookie-${entry.platform}`}
+                        className="mv-focus inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-lg border border-border-default bg-surface-elevated px-3 text-[13px] font-medium text-ink-primary shadow-[var(--shadow-xs)] transition-colors hover:border-border-strong hover:bg-surface-high disabled:opacity-50"
+                      >
+                        <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>Replace</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isBusy}
+                        onClick={() => void handleDeleteCookie(entry.platform)}
+                        aria-label={`Delete ${entry.platform} cookies`}
+                        title={`Delete ${entry.platform} cookies`}
+                        data-testid={`delete-cookie-${entry.platform}`}
+                        className="mv-focus inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-border-default bg-surface-elevated text-ink-secondary shadow-[var(--shadow-xs)] transition-colors hover:border-failed-border hover:bg-failed-bg hover:text-failed disabled:opacity-50"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
+
+        {cookieMap.get('dailymotion')?.installed && (
+          <div>
             <button
               type="button"
               onClick={() => void handleDeleteCookie('dailymotion')}
@@ -646,8 +921,8 @@ export default function SettingsPage() {
               <Trash2 className="h-3 w-3" aria-hidden="true" />
               <span>Remove Dailymotion</span>
             </button>
-          )}
-        </div>
+          </div>
+        )}
       </section>
 
       {/* Section 2.5: How to Access Age-Restricted Videos Guide */}
@@ -688,7 +963,8 @@ export default function SettingsPage() {
                   Sign in to the platform in your browser
                 </p>
                 <p className="text-xs leading-relaxed text-ink-secondary">
-                  Open YouTube, Instagram, X, Facebook, or Dailymotion and sign into an account
+                  Open the site that asked for cookies (YouTube, Instagram, X, Facebook,
+                  Dailymotion, Hotstar, or any other supported site) and sign into an account
                   that can view the video.
                 </p>
                 <p className="rounded-md border border-border-subtle bg-surface px-2.5 py-1.5 text-[11px] leading-relaxed text-ink-secondary">
@@ -730,8 +1006,10 @@ export default function SettingsPage() {
                   </p>
                   <p className="text-xs leading-relaxed text-ink-secondary">
                     Click <strong className="font-medium text-ink-primary">Upload cookies.txt</strong>{' '}
-                    on the matching platform card above, or select a platform pill and drop the file
-                    into the Upload Dropzone.
+                    on the matching platform card above, or for any other site (e.g.{' '}
+                    <code className="font-mono text-[11px]">hotstar.com</code>) type its domain in{' '}
+                    <strong className="font-medium text-ink-primary">Add cookies for any site</strong>{' '}
+                    and upload the file there.
                   </p>
                 </div>
                 <div>
