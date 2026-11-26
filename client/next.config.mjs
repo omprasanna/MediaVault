@@ -1,5 +1,5 @@
 /** @type {import('next').NextConfig} */
-const internalApiUrl = (process.env.INTERNAL_API_URL || 'http://api:5000').replace(/\/+$/, '');
+const internalApiUrl = (process.env.INTERNAL_API_URL || 'http://127.0.0.1:5000').replace(/\/+$/, '');
 
 const nextConfig = {
   allowedDevOrigins: ['*.trycloudflare.com'],
