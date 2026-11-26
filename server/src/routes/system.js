@@ -13,6 +13,7 @@ const execFileAsync = promisify(execFile);
 const router = express.Router();
 
 let cachedToolVersionsPromise = null;
+let cachedExtractorsPromise = null;
 
 router.get('/remote', (_req, res) => {
   return res.status(200).json({ tunnel: remoteTunnel.getStatus() });
@@ -56,6 +57,50 @@ function readToolVersionsOnce() {
   }));
 
   return cachedToolVersionsPromise;
+}
+
+/**
+ * Reads (and caches) every extractor reported by the installed yt-dlp build.
+ * Extractor variants such as `youtube:tab` collapse to a single base provider.
+ */
+function readSupportedExtractorsOnce() {
+  if (cachedExtractorsPromise) {
+    return cachedExtractorsPromise;
+  }
+
+  cachedExtractorsPromise = execFileAsync('yt-dlp', ['--list-extractors'], {
+    shell: false,
+    timeout: 15000,
+    maxBuffer: 8 * 1024 * 1024,
+  })
+    .then(({ stdout }) => {
+      const extractors = String(stdout || '')
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const providerSet = new Set();
+      for (const name of extractors) {
+        const base = name
+          .replace(/\s*\(CURRENTLY BROKEN\)\s*$/i, '')
+          .split(':')[0]
+          .trim();
+        if (base) {
+          providerSet.add(base);
+        }
+      }
+      return {
+        totalExtractors: extractors.length,
+        uniqueProviders: providerSet.size,
+        providers: Array.from(providerSet).sort((a, b) => a.localeCompare(b)),
+      };
+    })
+    .catch(() => ({
+      totalExtractors: 0,
+      uniqueProviders: 0,
+      providers: [],
+    }));
+
+  return cachedExtractorsPromise;
 }
 
 async function sumDirectoryBytes(dirPath) {
@@ -102,6 +147,29 @@ async function computeTempDirectoryStats(downloadsDir) {
 }
 
 /**
+ * GET /api/system/providers
+ * Returns the full list of providers/extractors reported by the installed yt-dlp build.
+ * Optional `?q=` filters provider names by substring.
+ */
+router.get('/providers', async (req, res, next) => {
+  try {
+    const catalog = await readSupportedExtractorsOnce();
+    const query = String(req.query.q || '').trim().toLowerCase();
+    const providers = query
+      ? catalog.providers.filter((name) => name.toLowerCase().includes(query))
+      : catalog.providers;
+
+    return res.status(200).json({
+      totalExtractors: catalog.totalExtractors,
+      uniqueProviders: catalog.uniqueProviders,
+      providers,
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
  * GET /api/system/status
  * Returns live binary versions, temp storage metrics, worker config, and job counts.
  */
@@ -116,17 +184,21 @@ router.get('/status', async (req, res, next) => {
       ? { userId, status: 'queued' }
       : { status: 'queued' };
 
-    const [tools, disk, activeJobsCount, queuedJobsCount] = await Promise.all([
-      readToolVersionsOnce(),
-      computeTempDirectoryStats(downloadsDir),
-      Job.countDocuments(activeFilter),
-      Job.countDocuments(queuedFilter),
-    ]);
+    const [tools, disk, activeJobsCount, queuedJobsCount, providerCatalog] =
+      await Promise.all([
+        readToolVersionsOnce(),
+        computeTempDirectoryStats(downloadsDir),
+        Job.countDocuments(activeFilter),
+        Job.countDocuments(queuedFilter),
+        readSupportedExtractorsOnce(),
+      ]);
 
     return res.status(200).json({
       system: {
         ytDlpVersion: tools.ytDlpVersion,
         ffmpegInstalled: tools.ffmpegInstalled,
+        supportedProvidersCount: providerCatalog.uniqueProviders,
+        supportedExtractorsCount: providerCatalog.totalExtractors,
         tempStorageBytes: disk.tempStorageBytes,
         tempDiskFreeBytes: disk.tempDiskFreeBytes,
         downloadTtlMinutes: parseDownloadTtlMinutes(process.env.DOWNLOAD_TTL_MINUTES),

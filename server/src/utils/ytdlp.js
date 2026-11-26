@@ -1,10 +1,11 @@
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
+const net = require('net');
 const os = require('os');
 const path = require('path');
 const { AppError } = require('./errors');
-const { resolvePublicUrl } = require('./ssrf');
+const { isPrivateIp, resolvePublicUrl } = require('./ssrf');
 const {
   buildProxyChildEnv,
   createPinnedSsrfProxy,
@@ -47,8 +48,98 @@ const HOST_PLATFORM_MAP = {
   'www.dai.ly': 'dailymotion',
 };
 
+// yt-dlp ships 1,700+ extractors. Rather than hardcoding every hostname, MediaVault
+// accepts any public HTTP(S) URL and derives a stable platform slug from the hostname.
+// SSRF protection still runs on every request via resolvePublicUrl/assertPublicUrl.
+const PLATFORM_SLUG_REGEX = /^[a-z0-9](?:[a-z0-9.-]{0,98}[a-z0-9])?$/;
+const RESTRICTED_HOSTNAMES = new Set(['localhost', 'localhost.localdomain']);
+const MULTI_PART_PUBLIC_SUFFIXES = new Set([
+  'ac.uk',
+  'co.in',
+  'co.jp',
+  'co.kr',
+  'co.uk',
+  'co.za',
+  'com.au',
+  'com.br',
+  'com.cn',
+  'com.hk',
+  'com.mx',
+  'com.sg',
+  'com.tr',
+  'com.tw',
+  'gov.uk',
+  'net.au',
+  'org.au',
+  'org.uk',
+]);
+
 /**
- * Validates and normalizes a media URL against the strict MediaVault platform allowlist.
+ * Returns whether a value is a safe platform identifier suitable for storage and
+ * for building `<platform>.txt` cookie filenames (no path separators or `..`).
+ *
+ * @param {string} value
+ * @returns {boolean}
+ */
+function isValidPlatformSlug(value) {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const slug = value.trim().toLowerCase();
+  return (
+    slug.length > 0 &&
+    slug.length <= 100 &&
+    !slug.includes('..') &&
+    PLATFORM_SLUG_REGEX.test(slug)
+  );
+}
+
+/**
+ * Derives a stable, filename-safe platform slug from a hostname.
+ * Known MediaVault platforms keep their short IDs; everything else becomes the
+ * registrable domain (e.g. `www.tiktok.com` -> `tiktok.com`, `player.vimeo.com` ->
+ * `vimeo.com`) so per-site cookie files can be resolved deterministically.
+ *
+ * @param {string} hostname
+ * @returns {string}
+ */
+function derivePlatformSlug(hostname) {
+  const normalized = String(hostname || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^\[(.*)\]$/, '$1')
+    .replace(/\.+$/, '');
+
+  if (!normalized) {
+    return 'unknown';
+  }
+
+  if (net.isIP(normalized)) {
+    const ipSlug = normalized.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    return isValidPlatformSlug(`ip-${ipSlug}`) ? `ip-${ipSlug}` : 'unknown';
+  }
+
+  const labels = normalized.split('.').filter(Boolean);
+  if (labels.length === 0) {
+    return 'unknown';
+  }
+  if (labels.length === 1) {
+    return isValidPlatformSlug(labels[0]) ? labels[0] : 'unknown';
+  }
+
+  const lastTwo = labels.slice(-2).join('.');
+  const start = MULTI_PART_PUBLIC_SUFFIXES.has(lastTwo)
+    ? labels.length - 3
+    : labels.length - 2;
+  const registrable = labels.slice(Math.max(0, start)).join('.');
+
+  return isValidPlatformSlug(registrable) ? registrable : 'unknown';
+}
+
+/**
+ * Validates and normalizes a media URL. Any public HTTP(S) URL supported by the
+ * installed yt-dlp build is accepted; private, loopback, and credential-bearing
+ * URLs are rejected up front, with full DNS/SSRF validation performed downstream.
  *
  * @param {string} rawUrl
  * @returns {{ url: string, platform: string, hostname: string, parsedUrl: URL }}
@@ -78,14 +169,29 @@ function validateMediaUrl(rawUrl) {
     throw new AppError(400, 'INVALID_URL', 'URLs containing credentials are not allowed.');
   }
 
-  const hostname = parsed.hostname.toLowerCase();
-  const platform = HOST_PLATFORM_MAP[hostname];
-  if (!platform) {
+  const hostname = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+  if (
+    !hostname ||
+    RESTRICTED_HOSTNAMES.has(hostname) ||
+    hostname.endsWith('.localhost') ||
+    hostname.endsWith('.local') ||
+    hostname.endsWith('.internal')
+  ) {
+    throw new AppError(400, 'INVALID_URL', 'Target host resolves to a restricted address.');
+  }
+
+  const bareHost = hostname.replace(/^\[(.*)\]$/, '$1');
+  if (net.isIP(bareHost) && isPrivateIp(bareHost)) {
     throw new AppError(
       400,
       'INVALID_URL',
-      'The provided URL domain is not supported by MediaVault.'
+      'Target host resolves to a restricted IP address.'
     );
+  }
+
+  const platform = HOST_PLATFORM_MAP[hostname] || derivePlatformSlug(hostname);
+  if (!isValidPlatformSlug(platform)) {
+    throw new AppError(400, 'INVALID_URL', 'The provided URL is not supported or invalid.');
   }
 
   return {
@@ -122,7 +228,7 @@ function isPlaylistOnlyUrl(parsedUrl) {
  * @returns {Promise<string>}
  */
 async function resolveCookieFile(platform) {
-  if (!ALLOWED_PLATFORMS.includes(platform)) {
+  if (!isValidPlatformSlug(platform)) {
     throw new AppError(400, 'INVALID_URL', 'Unsupported platform for cookie lookup.');
   }
 
@@ -417,6 +523,8 @@ async function inspectMediaUrl(
 module.exports = {
   ALLOWED_PLATFORMS,
   HOST_PLATFORM_MAP,
+  isValidPlatformSlug,
+  derivePlatformSlug,
   validateMediaUrl,
   isPlaylistOnlyUrl,
   resolveCookieFile,

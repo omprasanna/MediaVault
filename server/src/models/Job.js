@@ -19,9 +19,9 @@ const jobSchema = new mongoose.Schema(
     },
     platform: {
       type: String,
-      enum: ['youtube', 'instagram', 'facebook', 'x', 'dailymotion', 'unknown'],
       required: true,
       index: true,
+      match: /^[a-z0-9](?:[a-z0-9.-]{0,98}[a-z0-9])?$/,
     },
     title: {
       type: String,

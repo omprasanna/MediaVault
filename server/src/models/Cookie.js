@@ -4,10 +4,10 @@ const cookieSchema = new mongoose.Schema(
   {
     platform: {
       type: String,
-      enum: ['youtube', 'instagram', 'facebook', 'x', 'dailymotion'],
       required: true,
       unique: true,
       index: true,
+      match: /^[a-z0-9](?:[a-z0-9.-]{0,98}[a-z0-9])?$/,
     },
     content: {
       type: String,

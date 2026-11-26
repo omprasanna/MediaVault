@@ -115,6 +115,8 @@ export interface CookiePlatformStatus {
 export interface SystemStatusInfo {
   ytDlpVersion: string;
   ffmpegInstalled: boolean;
+  supportedProvidersCount?: number;
+  supportedExtractorsCount?: number;
   tempStorageBytes: number;
   tempDiskFreeBytes: number;
   downloadTtlMinutes: number;
@@ -143,13 +145,21 @@ export interface PlaylistFormatPreset {
   formatSelector: string;
 }
 
+/**
+ * Number of extractors shipped by the bundled yt-dlp build. Kept as a static
+ * fallback for the UI; the live count is exposed by `/api/system/status`.
+ */
+export const SUPPORTED_PROVIDER_COUNT = 1752;
+
 export const SUPPORTED_PLATFORMS = [
   { id: 'youtube', label: 'YouTube', shortLabel: 'YT' },
-  { id: 'yt-music', label: 'YT Music', shortLabel: 'YTM' },
+  { id: 'tiktok.com', label: 'TikTok', shortLabel: 'TT' },
   { id: 'instagram', label: 'Instagram', shortLabel: 'IG' },
   { id: 'x', label: 'X', shortLabel: 'X' },
   { id: 'facebook', label: 'Facebook', shortLabel: 'FB' },
-  { id: 'dailymotion', label: 'Dailymotion', shortLabel: 'DM' },
+  { id: 'vimeo.com', label: 'Vimeo', shortLabel: 'VM' },
+  { id: 'soundcloud.com', label: 'SoundCloud', shortLabel: 'SC' },
+  { id: 'twitch.tv', label: 'Twitch', shortLabel: 'TW' },
 ] as const;
 
 export const PLAYLIST_FORMAT_PRESETS: readonly PlaylistFormatPreset[] = [
@@ -313,6 +323,36 @@ export function formatBytes(bytes: number | null | undefined): string {
   return `${value.toFixed(decimals)} ${units[unitIdx]}`;
 }
 
+const PLATFORM_LABELS: Record<string, string> = {
+  youtube: 'YouTube',
+  instagram: 'Instagram',
+  facebook: 'Facebook',
+  x: 'X',
+  dailymotion: 'Dailymotion',
+  'tiktok.com': 'TikTok',
+  'vimeo.com': 'Vimeo',
+  'soundcloud.com': 'SoundCloud',
+  'twitch.tv': 'Twitch',
+  'reddit.com': 'Reddit',
+  'bilibili.com': 'BiliBili',
+  'rumble.com': 'Rumble',
+  'kick.com': 'Kick',
+  'bandcamp.com': 'Bandcamp',
+  'streamable.com': 'Streamable',
+  'bitchute.com': 'BitChute',
+  'odysee.com': 'Odysee',
+  'archive.org': 'Internet Archive',
+  'nicovideo.jp': 'NicoNico',
+  'weibo.com': 'Weibo',
+  'vk.com': 'VK',
+  'tumblr.com': 'Tumblr',
+  'pinterest.com': 'Pinterest',
+  'linkedin.com': 'LinkedIn',
+  'ted.com': 'TED',
+  'bbc.co.uk': 'BBC',
+  'cnn.com': 'CNN',
+};
+
 export function formatPlatformLabel(platform: string, sourceUrl?: string): string {
   const normalized = String(platform || '').toLowerCase();
   if (normalized === 'youtube') {
@@ -321,11 +361,15 @@ export function formatPlatformLabel(platform: string, sourceUrl?: string): strin
     }
     return 'YouTube';
   }
-  if (normalized === 'instagram') return 'Instagram';
-  if (normalized === 'facebook') return 'Facebook';
-  if (normalized === 'x') return 'X';
-  if (normalized === 'dailymotion') return 'Dailymotion';
-  return normalized ? normalized.toUpperCase() : 'Unknown';
+  const known = PLATFORM_LABELS[normalized];
+  if (known) {
+    return known;
+  }
+  if (!normalized) {
+    return 'Unknown';
+  }
+  const first = normalized.split('.')[0] || normalized;
+  return first.charAt(0).toUpperCase() + first.slice(1);
 }
 
 export async function extractApiError(res: Response, fallback: string): Promise<string> {

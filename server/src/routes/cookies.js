@@ -5,7 +5,7 @@ const path = require('path');
 const Cookie = require('../models/Cookie');
 const { MAX_COOKIE_BYTES, validateNetscapeCookies } = require('../utils/cookieValidator');
 const { AppError } = require('../utils/errors');
-const { ALLOWED_PLATFORMS } = require('../utils/ytdlp');
+const { ALLOWED_PLATFORMS, isValidPlatformSlug } = require('../utils/ytdlp');
 
 const router = express.Router();
 
@@ -23,14 +23,33 @@ function getCookiesDir() {
 
 function validatePlatformParam(rawPlatform) {
   const platform = String(rawPlatform || '').trim().toLowerCase();
-  if (!ALLOWED_PLATFORMS.includes(platform)) {
+  if (!isValidPlatformSlug(platform)) {
     throw new AppError(
       400,
       'INVALID_REQUEST',
-      `Unsupported platform "${platform}". Allowed: ${ALLOWED_PLATFORMS.join(', ')}.`
+      'Invalid platform identifier. Use a lowercase provider slug or domain (letters, numbers, dots, and dashes only).'
     );
   }
   return platform;
+}
+
+async function listCookiePlatforms(cookiesDir) {
+  const platforms = new Set(ALLOWED_PLATFORMS);
+  try {
+    const entries = await fs.promises.readdir(cookiesDir);
+    for (const entry of entries) {
+      if (!entry.toLowerCase().endsWith('.txt')) {
+        continue;
+      }
+      const candidate = entry.slice(0, -4).trim().toLowerCase();
+      if (isValidPlatformSlug(candidate)) {
+        platforms.add(candidate);
+      }
+    }
+  } catch {
+    // Cookies directory does not exist yet; the built-in presets still apply.
+  }
+  return Array.from(platforms);
 }
 
 function handleUploadMiddleware(req, res, next) {
@@ -70,9 +89,10 @@ router.get('/', async (_req, res, next) => {
     const cookiesDir = getCookiesDir();
     const docs = await Cookie.find().select('platform isValid updatedAt').lean();
     const docsByPlatform = new Map(docs.map((doc) => [doc.platform, doc]));
+    const platforms = await listCookiePlatforms(cookiesDir);
 
     const cookies = await Promise.all(
-      ALLOWED_PLATFORMS.map(async (platform) => {
+      platforms.map(async (platform) => {
         const filePath = path.join(cookiesDir, `${platform}.txt`);
         let fileStats = null;
         try {

@@ -10,7 +10,7 @@
 ## 1. Executive Summary & Goals
 
 ### 1.1 Objective
-Build a lightweight, zero-cost, self-hosted web application that enables downloading video and audio content from YouTube (including YouTube Music), Facebook, Instagram, X (Twitter), and Dailymotion. The system provides real-time format selection (up to 1080p video resolution and MP3 audio extraction) and supports both individual URLs and selective multi-item playlist batch downloads.
+Build a lightweight, zero-cost, self-hosted web application that enables downloading video and audio content from any site supported by the bundled `yt-dlp` build (over 1,700 extractors). YouTube (including YouTube Music), Facebook, Instagram, X (Twitter), and Dailymotion remain first-class platforms with tailored playlist handling and labels, while any other public URL accepted by `yt-dlp` is supported generically. The system provides real-time format selection (up to 1080p video resolution and MP3 audio extraction) and supports both individual URLs and selective multi-item playlist batch downloads.
 
 ### 1.2 Key Design Principles & Constraints
 * **₹0 Cost Footprint:** Operates completely inside a local Docker Compose topology on home hardware/residential IP. Avoids paid cloud egress, third-party API keys, or cloud storage costs.
@@ -37,7 +37,7 @@ Build a lightweight, zero-cost, self-hosted web application that enables downloa
 3. **Download History Page:**
    * Lists recently processed files with individual download links, source metadata, and auto-expiry timers.
 4. **Settings & Cookie Manager:**
-   * Interface to upload, inspect, and delete Netscape-formatted `cookies.txt` files per supported domain (`youtube.txt`, `instagram.txt`, `x.txt`, `facebook.txt`).
+   * Interface to upload, inspect, and delete Netscape-formatted `cookies.txt` files for any platform slug (`youtube.txt`, `instagram.txt`, `x.txt`, `tiktok.com.txt`, etc.).
    * Toggle switch for "Enable Authentication Cookies for Downloads".
 
 ### 2.2 Complete Downloader Flow Diagram
@@ -87,6 +87,10 @@ Build a lightweight, zero-cost, self-hosted web application that enables downloa
 ---
 
 ## 3. Supported Platforms & Quality Matrix
+
+**Any public HTTP(S) URL supported by the bundled `yt-dlp` build is accepted** — the application no longer enforces a fixed hostname allowlist. The platform catalog is read at runtime from `yt-dlp --list-extractors` (currently 1,752 extractors across 1,375 providers) and exposed via `GET /api/system/providers`. Unknown hosts receive a derived platform slug (e.g. `www.tiktok.com` → `tiktok.com`) for labels and cookie files. URLs are still screened for SSRF safety (no private/loopback/link-local addresses, no embedded credentials) before any request is made.
+
+The table below documents the first-class platforms with dedicated URL heuristics, labels, and playlist handling. Generic sites support single-item downloads with the same 1080p/stream-copy rules.
 
 | Platform | URL Types | Maximum Resolution | Container / Codec | Muxing Strategy |
 | :--- | :--- | :--- | :--- | :--- |
@@ -153,7 +157,7 @@ const JobSchema = new Schema({
   userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
   batchId: { type: String, default: null }, // Groups items from a playlist inspection
   sourceUrl: { type: String, required: true },
-  platform: { type: String, enum: ['youtube', 'instagram', 'facebook', 'x', 'dailymotion', 'unknown'], required: true },
+  platform: { type: String, match: /^[a-z0-9](?:[a-z0-9.-]{0,98}[a-z0-9])?$/, required: true }, // known slug or derived registrable domain
   title: { type: String, default: 'Media File' },
   thumbnail: { type: String },
   mode: { type: String, enum: ['video', 'audio'], required: true },
@@ -246,9 +250,9 @@ JobSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 }); // MongoDB TTL aut
 * `GET /api/jobs/:id/file` — Downloads finished output file from disk (`/data/downloads`).
 
 ### 6.4 Cookie Management
-* `GET /api/cookies` — Lists status of domain cookie files (`youtube.txt`, `instagram.txt`, etc.).
-* `POST /api/cookies/:platform` — Accepts text/file payload of Netscape formatted `cookies.txt`.
-* `DELETE /api/cookies/:platform` — Removes specified cookie file.
+* `GET /api/cookies` — Lists installed cookie files for any safe platform slug (`youtube.txt`, `tiktok.com.txt`, etc.).
+* `POST /api/cookies/:platform` — Accepts text/file payload of Netscape formatted `cookies.txt` for any safe platform slug.
+* `DELETE /api/cookies/:platform` — Removes the specified cookie file.
 
 ---
 

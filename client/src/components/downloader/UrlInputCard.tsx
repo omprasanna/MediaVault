@@ -12,7 +12,7 @@ import {
   Search,
   X,
 } from 'lucide-react';
-import { SUPPORTED_PLATFORMS } from '@/lib/mediaTypes';
+import { SUPPORTED_PLATFORMS, SUPPORTED_PROVIDER_COUNT } from '@/lib/mediaTypes';
 
 interface UrlInputCardProps {
   variant: 'hero' | 'compact';
@@ -77,7 +77,7 @@ export function UrlInputCard({
       return 'Enter a media or playlist URL to inspect.';
     }
     if (!isValidHttpUrl(trimmed)) {
-      return 'Enter a full http:// or https:// URL from a supported platform.';
+      return 'Enter a full http:// or https:// media or playlist URL.';
     }
     return null;
   }
@@ -185,7 +185,7 @@ export function UrlInputCard({
                 onKeyDown={handleKeyDown}
                 autoComplete="off"
                 spellCheck={false}
-                placeholder="Paste YouTube, YT Music, Instagram, X, Facebook, or Dailymotion URL..."
+                placeholder="Paste any video or audio URL (YouTube, TikTok, Vimeo, 1,700+ sites)..."
                 aria-invalid={displayError ? 'true' : 'false'}
                 aria-describedby={displayError ? errorId : undefined}
                 data-testid="url-input"
@@ -331,7 +331,7 @@ export function UrlInputCard({
               autoComplete="off"
               spellCheck={false}
               enterKeyHint="search"
-              placeholder="Paste URL (YouTube, YT Music, Instagram, X, Facebook, Dailymotion)..."
+              placeholder="Paste any video, audio, or playlist URL (YouTube, TikTok, Vimeo, 1,700+ sites)..."
               aria-invalid={displayError ? 'true' : 'false'}
               aria-describedby={displayError ? errorId : undefined}
               data-testid="url-input"
@@ -478,6 +478,9 @@ export function UrlInputCard({
                 <span className="hidden sm:inline">{platform.label}</span>
               </span>
             ))}
+            <span className="rounded border border-accent-border bg-accent-soft px-2 py-0.5 font-mono text-[11px] font-semibold tabular-nums text-accent-text">
+              {SUPPORTED_PROVIDER_COUNT.toLocaleString('en-US')}+ sites
+            </span>
           </div>
         </div>
       </form>

@@ -29,6 +29,7 @@ import {
   Moon,
   PlayCircle,
   RefreshCw,
+  Search,
   Shield,
   Sun,
   Trash2,
@@ -100,6 +101,11 @@ export default function SettingsPage() {
   const { data: systemData, mutate: mutateSystem } = useSWR<{
     system?: SystemStatusInfo;
   }>('/api/system/status', swrJsonFetcher);
+  const { data: providersData } = useSWR<{
+    totalExtractors?: number;
+    uniqueProviders?: number;
+    providers?: string[];
+  }>('/api/system/providers', swrJsonFetcher, { revalidateOnFocus: false });
 
   const user = meData?.user ?? null;
   const cookies = useMemo(
@@ -108,6 +114,14 @@ export default function SettingsPage() {
   );
   const cookiesLoading = Boolean(!cookiesData && cookiesSwrLoading);
   const systemStatus = systemData?.system ?? null;
+
+  const [providerQuery, setProviderQuery] = useState<string>('');
+  const providerList = useMemo(() => {
+    const all = Array.isArray(providersData?.providers) ? providersData.providers : [];
+    const query = providerQuery.trim().toLowerCase();
+    return query ? all.filter((name) => name.toLowerCase().includes(query)) : all;
+  }, [providerQuery, providersData]);
+  const visibleProviders = providerList.slice(0, 200);
 
   const [targetPlatform, setTargetPlatform] = useState<CookiePlatform>('youtube');
   const [dragActive, setDragActive] = useState<boolean>(false);
@@ -827,7 +841,7 @@ export default function SettingsPage() {
 
         <div
           data-testid="engine-info-strip"
-          className="grid grid-cols-1 gap-4 rounded-xl border border-border-default bg-surface p-4 shadow-[var(--shadow-xs)] sm:grid-cols-2 lg:grid-cols-4"
+          className="grid grid-cols-1 gap-4 rounded-xl border border-border-default bg-surface p-4 shadow-[var(--shadow-xs)] sm:grid-cols-2 lg:grid-cols-5"
         >
           <div className="flex flex-col gap-1">
             <span className="text-[11px] font-medium uppercase tracking-[0.02em] text-ink-muted">
@@ -835,6 +849,22 @@ export default function SettingsPage() {
             </span>
             <span className="font-mono text-xs font-medium tabular-nums text-ink-primary">
               {systemStatus?.ytDlpVersion || 'Loading...'}
+            </span>
+          </div>
+
+          <div className="flex flex-col gap-1">
+            <span className="text-[11px] font-medium uppercase tracking-[0.02em] text-ink-muted">
+              Supported sites
+            </span>
+            <span className="font-mono text-xs font-medium tabular-nums text-ink-primary">
+              {systemStatus
+                ? `${(systemStatus.supportedProvidersCount || 0).toLocaleString('en-US')} providers`
+                : 'Loading...'}
+            </span>
+            <span className="font-mono text-[10px] tabular-nums text-ink-muted">
+              {systemStatus?.supportedExtractorsCount
+                ? `${systemStatus.supportedExtractorsCount.toLocaleString('en-US')} extractors`
+                : ''}
             </span>
           </div>
 
@@ -885,6 +915,76 @@ export default function SettingsPage() {
             </span>
           </div>
         </div>
+      </section>
+
+      {/* Section 3.5: Supported Sites Catalog */}
+      <section aria-labelledby="supported-sites-heading" className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Globe className="h-4 w-4 text-accent-text" aria-hidden="true" />
+            <h2
+              id="supported-sites-heading"
+              className="text-sm font-semibold text-ink-primary"
+            >
+              Supported Sites
+            </h2>
+          </div>
+          <span className="rounded border border-border-default bg-surface px-2 py-0.5 font-mono text-[11px] tabular-nums text-ink-secondary">
+            {providersData?.uniqueProviders
+              ? `${providersData.uniqueProviders.toLocaleString('en-US')} providers`
+              : 'Loading...'}
+          </span>
+        </div>
+        <p className="text-[13px] text-ink-secondary">
+          MediaVault forwards any public URL to the bundled yt-dlp build. Search the live
+          extractor catalog below, then paste a link on the Downloader page.
+        </p>
+        <div className="flex items-center gap-2 rounded-lg border border-border-default bg-surface-recessed px-3 py-2 transition-colors focus-within:border-accent">
+          <Search className="h-4 w-4 shrink-0 text-accent-text" aria-hidden="true" />
+          <label htmlFor="provider-search" className="sr-only">
+            Search supported sites
+          </label>
+          <input
+            id="provider-search"
+            type="search"
+            value={providerQuery}
+            onChange={(event) => setProviderQuery(event.target.value)}
+            placeholder="Search 1,375+ providers (TikTok, Vimeo, SoundCloud...)"
+            autoComplete="off"
+            spellCheck={false}
+            className="min-w-0 flex-1 bg-transparent py-1 font-mono text-[13px] text-ink-primary placeholder:text-ink-placeholder focus:outline-none"
+          />
+          <span className="shrink-0 font-mono text-[11px] tabular-nums text-ink-muted">
+            {providerList.length.toLocaleString('en-US')} shown
+          </span>
+        </div>
+        <div className="max-h-64 overflow-y-auto rounded-xl border border-border-default bg-surface shadow-[var(--shadow-xs)]">
+          {visibleProviders.length > 0 ? (
+            <ul className="divide-y divide-border-subtle">
+              {visibleProviders.map((name) => (
+                <li
+                  key={name}
+                  className="px-3 py-1.5 font-mono text-xs text-ink-secondary"
+                >
+                  {name}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="px-3 py-6 text-center text-xs text-ink-muted">
+              {providersData
+                ? 'No providers match that search.'
+                : 'Loading provider catalog...'}
+            </p>
+          )}
+        </div>
+        {providerList.length > visibleProviders.length && (
+          <p className="font-mono text-[11px] text-ink-muted">
+            Showing first {visibleProviders.length.toLocaleString('en-US')} of{' '}
+            {providerList.length.toLocaleString('en-US')} matches. Refine your search to
+            narrow the list.
+          </p>
+        )}
       </section>
 
       {/* Section 4: Appearance & Operator Session */}

@@ -1,6 +1,6 @@
 # MediaVault
 
-A private, self-hosted multi-platform media downloader web app (supports YouTube, YouTube Music, Instagram, X, Facebook, and Dailymotion) built for a ₹0 local Docker Compose stack.
+A private, self-hosted media downloader web app powered by `yt-dlp` (1,752 extractors across ~1,375 providers — YouTube, YouTube Music, TikTok, Vimeo, SoundCloud, Instagram, X, Facebook, Dailymotion, and hundreds more) built for a ₹0 local Docker Compose stack.
 
 ---
 
@@ -209,6 +209,18 @@ Use this option if you own a domain on Cloudflare and want a fixed URL (for exam
      ```powershell
      docker compose --profile tunnel stop cloudflared
      ```
+
+---
+
+## Supported Sites
+
+MediaVault passes any public `http://` or `https://` URL to the bundled `yt-dlp` build, so downloads work across the full extractor catalog instead of a fixed shortlist.
+
+- **1,752 extractors across ~1,375 providers** in the bundled yt-dlp build (counts update automatically with the installed binary).
+- Paste a URL from YouTube, YouTube Music, TikTok, Vimeo, SoundCloud, Twitch, Instagram, X, Facebook, Dailymotion, Reddit, BiliBili, and hundreds more.
+- The original six platforms keep dedicated playlist batch support; other sites download single items and any site-specific playlists that yt-dlp exposes.
+- Discover the live list with `GET /api/system/providers` (authenticated) or read the count on the **Settings → Self-Hosted Engine Info** panel.
+- SSRF protections still apply: private, loopback, link-local, and credential-bearing URLs are rejected, and every hostname is resolved and pinned to a validated public IP before yt-dlp connects.
 
 ---
 

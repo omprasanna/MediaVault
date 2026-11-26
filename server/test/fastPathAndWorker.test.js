@@ -4,7 +4,12 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { buildInspectArgs, validateMediaUrl } = require('../src/utils/ytdlp');
+const {
+  buildInspectArgs,
+  derivePlatformSlug,
+  isValidPlatformSlug,
+  validateMediaUrl,
+} = require('../src/utils/ytdlp');
 const { assertPublicUrl, isPrivateIp, resolvePublicUrl } = require('../src/utils/ssrf');
 const { mapInspectResponse, sanitizeFilename } = require('../src/utils/formatMapper');
 const {
@@ -37,19 +42,58 @@ test('validateMediaUrl accepts all 6 supported platforms and normalizes platform
   }
 });
 
-test('validateMediaUrl rejects disallowed domains, prefix spoofs, non-http, and flags', () => {
+test('validateMediaUrl rejects non-http, credential, flag, and private-host inputs', () => {
   const invalidInputs = [
     '',
-    'https://example.com/video.mp4',
-    'https://youtube.com.evil.com/watch?v=abc',
     'file:///etc/passwd',
     'javascript:alert(1)',
     '--exec=id',
     'https://user:pass@www.youtube.com/watch?v=abc',
+    'http://localhost/video',
+    'http://api.internal./secret',
+    'http://127.0.0.1/video.mp4',
+    'http://10.0.0.1/video.mp4',
+    'http://[::1]/video.mp4',
   ];
 
   for (const bad of invalidInputs) {
     assert.throws(() => validateMediaUrl(bad), { code: 'INVALID_URL' });
+  }
+});
+
+test('validateMediaUrl accepts any public yt-dlp URL and derives a safe platform slug', () => {
+  const cases = [
+    ['https://example.com/video.mp4', 'example.com'],
+    ['https://www.tiktok.com/@creator/video/123', 'tiktok.com'],
+    ['https://player.vimeo.com/video/123', 'vimeo.com'],
+    ['https://soundcloud.com/artist/track', 'soundcloud.com'],
+    ['https://youtube.com.evil.com/watch?v=abc', 'evil.com'],
+    ['https://www.bbc.co.uk/iplayer/episode/abc', 'bbc.co.uk'],
+  ];
+
+  for (const [input, expectedPlatform] of cases) {
+    const res = validateMediaUrl(input);
+    assert.equal(res.platform, expectedPlatform);
+  }
+
+  // Hostname spoofing must never inherit a trusted platform identity.
+  assert.notEqual(
+    validateMediaUrl('https://youtube.com.evil.com/watch?v=abc').platform,
+    'youtube'
+  );
+});
+
+test('derivePlatformSlug and isValidPlatformSlug keep cookie filenames safe', () => {
+  assert.equal(derivePlatformSlug('www.tiktok.com'), 'tiktok.com');
+  assert.equal(derivePlatformSlug('player.vimeo.com'), 'vimeo.com');
+  assert.equal(derivePlatformSlug('www.bbc.co.uk'), 'bbc.co.uk');
+  assert.equal(derivePlatformSlug('127.0.0.1'), 'ip-127-0-0-1');
+
+  for (const slug of ['youtube', 'tiktok.com', 'bbc.co.uk', 'ip-127-0-0-1']) {
+    assert.equal(isValidPlatformSlug(slug), true, `Expected ${slug} to be valid`);
+  }
+  for (const slug of ['', '../etc/passwd', 'a/b', 'a\\b', '..', '-leading']) {
+    assert.equal(isValidPlatformSlug(slug), false, `Expected ${slug} to be invalid`);
   }
 });
 

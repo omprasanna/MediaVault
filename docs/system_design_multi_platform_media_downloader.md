@@ -298,16 +298,8 @@ To handle non-public, member-only, or age-gated videos across YouTube, Instagram
 
 Even though this is a self-hosted tool, securing network inputs protects the host environment from Server-Side Request Forgery (SSRF) or arbitrary code execution.
 
-1. **Domain Allowlist Validation:**
-   ```javascript
-   const ALLOWED_DOMAINS = [
-     /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/i,
-     /^(https?:\/\/)?(www\.)?(instagram\.com|instagr\.am)/i,
-     /^(https?:\/\/)?(www\.)?(facebook\.com|fb\.watch)/i,
-     /^(https?:\/\/)?(www\.)?(twitter\.com|x\.com)/i,
-     /^(https?:\/\/)?(www\.)?(dailymotion\.com|dai\.ly)/i
-   ];
-   ```
+1. **Generic Provider Validation:**
+   MediaVault does not maintain a hostname allowlist. Any public HTTP(S) URL is accepted and handed to the bundled `yt-dlp` build, which ships 1,700+ extractors. Known platforms keep short platform IDs (`youtube`, `instagram`, `facebook`, `x`, `dailymotion`); every other URL gets a filename-safe registrable-domain slug (e.g. `www.tiktok.com` → `tiktok.com`) used for labels and per-site `<platform>.txt` cookie files. URLs with embedded credentials, non-HTTP schemes, and obviously restricted hostnames are rejected before any subprocess runs.
 
 2. **Internal IP Blacklisting (SSRF Shield):**
    Before forwarding proxy requests or spawning subprocesses, DNS names are resolved to verify target IPs do not fall into private ranges:

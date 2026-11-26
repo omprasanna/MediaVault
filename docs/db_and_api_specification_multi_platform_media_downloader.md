@@ -105,7 +105,7 @@ const jobSchema = new mongoose.Schema(
     },
     platform: {
       type: String,
-      enum: ['youtube', 'instagram', 'facebook', 'x', 'dailymotion', 'unknown'],
+      match: /^[a-z0-9](?:[a-z0-9.-]{0,98}[a-z0-9])?$/, // known slug (e.g. youtube) or derived registrable domain (e.g. tiktok.com)
       required: true,
       index: true
     },
@@ -256,7 +256,7 @@ const cookieSchema = new mongoose.Schema(
   {
     platform: {
       type: String,
-      enum: ['youtube', 'instagram', 'facebook', 'x', 'dailymotion'],
+      match: /^[a-z0-9](?:[a-z0-9.-]{0,98}[a-z0-9])?$/, // any safe platform slug, e.g. youtube or tiktok.com
       required: true,
       unique: true,
       index: true
@@ -536,7 +536,7 @@ Redis serves as the BullMQ task transport layer and live progress pub/sub channe
 * **Query Parameters:**
   * `url`: Encoded target CDN media link
   * `filename`: Target output file name
-  * `platform`: Domain identifier (`instagram`, `x`, `facebook`)
+  * `platform`: Platform slug (`instagram`, `x`, `facebook`, `tiktok.com`, ...)
 * **Behavior:** Directly pipes external byte stream to client using chunked transfer encoding without writing to server disk.
 
 ---
@@ -554,10 +554,12 @@ Redis serves as the BullMQ task transport layer and live progress pub/sub channe
       { "platform": "instagram", "installed": true, "updatedAt": "2026-11-18T14:22:00.000Z" },
       { "platform": "facebook", "installed": false, "updatedAt": null },
       { "platform": "x", "installed": false, "updatedAt": null },
-      { "platform": "dailymotion", "installed": false, "updatedAt": null }
+      { "platform": "dailymotion", "installed": false, "updatedAt": null },
+      { "platform": "tiktok.com", "installed": false, "updatedAt": null }
     ]
   }
   ```
+* **Notes:** Any safe platform slug is accepted; known platforms keep short identifiers and unknown hosts use a derived registrable domain.
 
 #### 2.5.2 Upload Netscape Cookies File
 * **Endpoint:** `POST /api/cookies/:platform`
@@ -592,16 +594,38 @@ Redis serves as the BullMQ task transport layer and live progress pub/sub channe
   ```json
   {
     "system": {
-      "ytDlpVersion": "2026.11.18",
+      "ytDlpVersion": "2026.11.23",
       "ffmpegInstalled": true,
+      "supportedProvidersCount": 1375,
+      "supportedExtractorsCount": 1752,
+      "tempStorageBytes": 0,
       "tempDiskFreeBytes": 48291048448,
+      "downloadTtlMinutes": 30,
+      "workerConcurrency": 2,
+      "allowRegistration": false,
       "activeJobsCount": 1,
-      "queuedJobsCount": 0
+      "queuedJobsCount": 0,
+      "dbConnected": true
     }
   }
   ```
 
-#### 2.6.2 Trigger Manual Extractor Update
+#### 2.6.2 List Supported Providers
+* **Endpoint:** `GET /api/system/providers`
+* **Access Control:** Authenticated
+* **Query Parameters:**
+  * `q` (optional): Case-insensitive substring filter on provider names.
+* **Behavior:** Returns the provider catalog read from the installed `yt-dlp --list-extractors` output (cached per process). Extractor variants such as `youtube:tab` collapse to a single base provider.
+* **Success Response (`200 OK`):**
+  ```json
+  {
+    "totalExtractors": 1752,
+    "uniqueProviders": 1375,
+    "providers": ["youtube", "tiktok", "vimeo", "..."]
+  }
+  ```
+
+#### 2.6.3 Trigger Manual Extractor Update
 * **Endpoint:** `POST /api/system/update-ytdlp`
 * **Access Control:** Authenticated (Admin)
 * **Behavior:** Spawns `yt-dlp -U` inside backend container to update extractors dynamically.
@@ -631,7 +655,7 @@ All JSON API errors return a standard envelope structure:
 
 | HTTP Code | Error Code Identifier | Description |
 | :--- | :--- | :--- |
-| `400 Bad Request` | `INVALID_URL` | URL failed regex validation or domain allowlist check. |
+| `400 Bad Request` | `INVALID_URL` | URL failed HTTP(S) format validation or SSRF safety checks (private/loopback/link-local host or embedded credentials). |
 | `401 Unauthorized` | `UNAUTHORIZED` | JWT token missing, expired, or invalid. |
 | `403 Forbidden` | `REGISTRATION_DISABLED` | Attempted registration when `ALLOW_REGISTRATION=false`. |
 | `404 Not Found` | `JOB_NOT_FOUND` | Requested job ID does not exist or file has expired. |
