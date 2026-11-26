@@ -1,4 +1,6 @@
 const { spawn } = require('child_process');
+const crypto = require('crypto');
+const fs = require('fs');
 const path = require('path');
 
 const VALID_ROLES = new Set(['all', 'api', 'worker', 'client']);
@@ -15,6 +17,54 @@ if (!VALID_ROLES.has(ROLE)) {
   );
   process.exit(1);
 }
+
+/**
+ * Ensures JWT_SECRET is available. If the operator did not pass one with
+ * `-e JWT_SECRET=...`, a cryptographically secure secret is generated once and
+ * persisted under CONFIG_DIR so sessions survive container recreation.
+ */
+function ensureJwtSecret() {
+  const provided = String(process.env.JWT_SECRET || '').trim();
+  if (provided) {
+    process.env.JWT_SECRET = provided;
+    console.log(
+      `[entrypoint] Using JWT_SECRET from environment (${provided.length} chars).`
+    );
+    return;
+  }
+
+  const configDir = process.env.CONFIG_DIR || '/data/config';
+  const secretFile = path.join(configDir, 'jwt_secret');
+
+  try {
+    const existing = fs.readFileSync(secretFile, 'utf8').trim();
+    if (existing.length >= 32) {
+      process.env.JWT_SECRET = existing;
+      console.log(`[entrypoint] Loaded persisted JWT_SECRET from ${secretFile}.`);
+      return;
+    }
+  } catch {
+    // Not generated yet
+  }
+
+  const generated = crypto.randomBytes(32).toString('hex');
+  try {
+    fs.mkdirSync(configDir, { recursive: true });
+    fs.writeFileSync(secretFile, `${generated}\n`, { mode: 0o600 });
+    console.log(
+      `[entrypoint] JWT_SECRET not provided; generated a new one and saved it to ${secretFile}.`
+    );
+  } catch (err) {
+    console.warn(
+      `[entrypoint] JWT_SECRET not provided; generated an ephemeral one (could not persist: ${err.message}). ` +
+        'Sessions will be invalidated when the container is recreated. Mount a volume at ' +
+        `${configDir} or pass -e JWT_SECRET=... to avoid this.`
+    );
+  }
+  process.env.JWT_SECRET = generated;
+}
+
+ensureJwtSecret();
 
 const activeChildren = new Map();
 let shuttingDown = false;

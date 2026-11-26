@@ -16,8 +16,72 @@ MediaVault runs inside a dedicated Docker network (`mediavault-net`) configured 
 | `cloudflared` | Optional Cloudflare Tunnel (`profiles: ["tunnel"]`) for encrypted phone/remote access |
 
 ---
-
 ## Quick Start
+
+**Easiest:** download only [docker/yt-downloader/docker-compose.yml](./docker/yt-downloader/docker-compose.yml) into any folder and run `docker compose up -d`. MongoDB, Redis and the app start together and show up grouped as **yt-downloader** in Docker Desktop. Override settings with `-e`-style env vars, e.g. `$env:ALLOW_REGISTRATION="false"; docker compose up -d`.
+
+Or with plain `docker run`:
+
+No repository, `.env`, or compose file needed — only Docker. Secrets are passed with `-e` at container creation:
+
+# 1. Pull images
+```powershell
+docker pull omprasannasahoo181/mediavault:latest
+docker pull mongo:7
+docker pull redis:7-alpine
+```
+# 2. Create a private network + dependencies
+```powershell
+docker network create mediavault-net
+docker run -d --name mediavault-mongo --network mediavault-net --restart unless-stopped `
+  --label com.docker.compose.project=yt-downloader `
+  --label com.docker.compose.service=mongo `
+  --label com.docker.compose.project-name=yt-downloader `
+  -v mediavault_mongo:/data/db mongo:7
+docker run -d --name mediavault-redis --network mediavault-net --restart unless-stopped `
+  --label com.docker.compose.project=yt-downloader `
+  --label com.docker.compose.service=redis `
+  --label com.docker.compose.project-name=yt-downloader `
+  -v mediavault_redis:/data redis:7-alpine redis-server --appendonly yes
+```
+# 3. Create the app container
+```powershell
+docker run -d --name mediavault --network mediavault-net --restart unless-stopped `
+  --label com.docker.compose.project=yt-downloader `
+  --label com.docker.compose.service=mediavault `
+  --label com.docker.compose.project-name=yt-downloader `
+  -p 3000:3000 `
+  -e ALLOW_REGISTRATION=true `
+  -v "${HOME}/Downloads/MediaVault:/data/downloads" `
+  -v mediavault_cookies:/data/cookies `
+  -v mediavault_config:/data/config `
+  omprasannasahoo181/mediavault:latest
+```
+
+After registering your own account, disable public registration by recreating the container with `ALLOW_REGISTRATION=false`:
+```powershell
+docker rm -f mediavault
+docker run -d --name mediavault --network mediavault-net --restart unless-stopped `
+  --label com.docker.compose.project=yt-downloader `
+  --label com.docker.compose.service=mediavault `
+  --label com.docker.compose.project-name=yt-downloader `
+  -p 3000:3000 `
+  -e ALLOW_REGISTRATION=false `
+  -v "${HOME}/Downloads/MediaVault:/data/downloads" `
+  -v mediavault_cookies:/data/cookies `
+  -v mediavault_config:/data/config `
+  omprasannasahoo181/mediavault:latest
+```
+
+**JWT secret:** if `JWT_SECRET` is not passed, the container generates a secure one on first start and stores it in the `mediavault_config` volume (reused on every recreate). To supply your own, add `-e JWT_SECRET=$(openssl rand -hex 32)` (or any random string of **32+ characters** — shorter or placeholder values are rejected).
+
+Any other setting (`MONGO_URI`, `REDIS_URL`, `COOKIE_SECURE`, `DOWNLOAD_TTL_MINUTES`, `WORKER_CONCURRENCY`, ...) can be overridden the same way with `-e KEY=value`. To change a value, recreate the container: `docker rm -f mediavault` and re-run step 3 (data in volumes is kept). To update: `docker pull omprasannasahoo181/mediavault:latest`, then recreate.
+
+Using external MongoDB/Redis instead? Skip step 2 and pass `-e MONGO_URI=... -e REDIS_URL=...`.
+
+---
+
+### Run with cloning (pull image + `docker run`)
 
 1. Create your local environment file from `.env.example` and generate a cryptographically secure `JWT_SECRET`:
 
@@ -35,8 +99,6 @@ MediaVault runs inside a dedicated Docker network (`mediavault-net`) configured 
    ```
 
 3. Open `http://localhost:3000`.
-
----
 
 ## Security Lockdown Checklist (Daily Self-Hosted Use)
 

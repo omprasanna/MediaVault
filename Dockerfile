@@ -55,11 +55,26 @@ ENV HOSTNAME=0.0.0.0
 ENV INTERNAL_API_URL=http://127.0.0.1:5000
 ENV DOWNLOADS_DIR=/data/downloads
 ENV COOKIES_DIR=/data/cookies
+ENV CONFIG_DIR=/data/config
 ENV APP_ROLE=all
+# Runtime defaults so the image works standalone with `docker run -e JWT_SECRET=...`
+# (override any of these with -e at container creation time)
+ENV MONGO_URI=mongodb://mediavault-mongo:27017/mediavault
+ENV REDIS_URL=redis://mediavault-redis:6379
+ENV JWT_EXPIRES_IN=7d
+ENV ALLOW_REGISTRATION=true
+ENV COOKIE_SECURE=false
+ENV DOWNLOAD_TTL_MINUTES=30
+ENV CLEANUP_INTERVAL_MINUTES=5
+ENV WORKER_CONCURRENCY=2
+ENV MAX_PLAYLIST_ITEMS=0
+ENV MAX_BATCH_ITEMS=0
+ENV MIN_FREE_DISK_BYTES=2147483648
+ENV REMOTE_TUNNEL_ORIGIN=http://127.0.0.1:3000
 ENV PATH="/opt/ytdlp-venv/bin:${PATH}"
 
 RUN apk add --no-cache nodejs python3 libffi libstdc++ libgcc ca-certificates ffmpeg \
-    && mkdir -p /data/downloads /data/cookies /app/server /app/client
+    && mkdir -p /data/downloads /data/cookies /data/config /app/server /app/client
 
 COPY --from=ytdlp-builder /opt/ytdlp-venv /opt/ytdlp-venv
 COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared

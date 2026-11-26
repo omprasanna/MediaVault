@@ -67,7 +67,8 @@ function validateJwtSecret(rawSecret = process.env.JWT_SECRET) {
 
   if (secret.length < MIN_JWT_SECRET_LENGTH) {
     throw new Error(
-      `JWT_SECRET must be at least ${MIN_JWT_SECRET_LENGTH} characters long. ${JWT_SECRET_HELP}`
+      `JWT_SECRET must be at least ${MIN_JWT_SECRET_LENGTH} characters long (received ${secret.length}). ` +
+        `Check the value passed via -e JWT_SECRET=... / .env (avoid quotes or truncation), or omit it to let the container auto-generate one. ${JWT_SECRET_HELP}`
     );
   }
 
