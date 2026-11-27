@@ -105,7 +105,45 @@ const jobSchema = new mongoose.Schema(
 // Compound index for fast user job history queries.
 jobSchema.index({ userId: 1, createdAt: -1 });
 
-// Native MongoDB TTL index: auto-purges expired job records.
-jobSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+// Non-TTL index for storage cleanup sweep lookups; expiration preserves history and reconciles batches.
+jobSchema.index({ expiresAt: 1 });
+
+/**
+ * Drops any legacy MongoDB TTL index on `expiresAt` (which silently purged documents
+ * without reconciling parent batch rollups) and ensures the plain query index exists.
+ */
+jobSchema.statics.ensureNonTtlExpiresIndex = async function ensureNonTtlExpiresIndex() {
+  let indexes = [];
+  try {
+    indexes = await this.collection.indexes();
+  } catch (err) {
+    if (err?.codeName === 'NamespaceNotFound' || err?.code === 26) {
+      await this.createIndexes();
+      return;
+    }
+    throw err;
+  }
+
+  for (const idx of indexes) {
+    if (
+      idx &&
+      idx.key &&
+      idx.key.expiresAt === 1 &&
+      Object.keys(idx.key).length === 1 &&
+      typeof idx.expireAfterSeconds === 'number'
+    ) {
+      try {
+        await this.collection.dropIndex(idx.name);
+      } catch (err) {
+        // API and worker processes can race while removing this legacy index.
+        if (err?.codeName !== 'IndexNotFound' && err?.code !== 27) {
+          throw err;
+        }
+      }
+    }
+  }
+
+  await this.createIndexes();
+};
 
 module.exports = mongoose.model('Job', jobSchema);

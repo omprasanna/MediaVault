@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { AppError } = require('./errors');
@@ -287,9 +288,46 @@ function sanitizeFolderName(title) {
   return clean || 'Playlist';
 }
 
+const LINK_FALLBACK_CODES = new Set([
+  'EXDEV',
+  'EPERM',
+  'ENOTSUP',
+  'EOPNOTSUPP',
+  'ENOSYS',
+  'EINVAL',
+  'EMLINK',
+]);
+
+async function tryMoveExclusive(srcPath, destPath) {
+  try {
+    await fs.promises.link(srcPath, destPath);
+    await fs.promises.unlink(srcPath).catch(() => {});
+    return true;
+  } catch (err) {
+    if (err && err.code === 'EEXIST') {
+      return false;
+    }
+    if (!err || !LINK_FALLBACK_CODES.has(err.code)) {
+      throw err;
+    }
+  }
+
+  try {
+    await fs.promises.copyFile(srcPath, destPath, fs.constants.COPYFILE_EXCL);
+    await fs.promises.unlink(srcPath).catch(() => {});
+    return true;
+  } catch (err) {
+    if (err && err.code === 'EEXIST') {
+      return false;
+    }
+    throw err;
+  }
+}
+
 /**
- * Moves a finished download from temporary scratch storage into `targetDir` using
- * a clean filename, appending `_(2)`, `_(3)`, ... if a collision already exists.
+ * Atomically moves a finished download from temporary scratch storage into `targetDir`
+ * using a clean filename, appending `_(2)`, `_(3)`, ... on collision without overwriting
+ * existing files.
  *
  * @param {string} srcPath
  * @param {string} targetDir
@@ -303,37 +341,29 @@ async function moveToUniquePath(srcPath, targetDir, desiredFileName) {
   const ext = path.extname(safeDesired);
   const base = path.basename(safeDesired, ext) || 'media_file';
 
-  let destPath = null;
   for (let attempt = 0; attempt < 1000; attempt += 1) {
     const candidateName = attempt === 0 ? `${base}${ext}` : `${base}_(${attempt + 1})${ext}`;
     const candidatePath = path.join(targetDir, candidateName);
-    try {
-      await fs.promises.access(candidatePath);
-    } catch {
-      destPath = candidatePath;
-      break;
+    if (await tryMoveExclusive(srcPath, candidatePath)) {
+      return {
+        filePath: candidatePath,
+        fileName: path.basename(candidatePath),
+      };
     }
   }
 
-  if (!destPath) {
-    destPath = path.join(targetDir, `${base}_${Date.now()}${ext}`);
-  }
-
-  try {
-    await fs.promises.rename(srcPath, destPath);
-  } catch (err) {
-    if (err && err.code === 'EXDEV') {
-      await fs.promises.copyFile(srcPath, destPath);
-      await fs.promises.unlink(srcPath).catch(() => {});
-    } else {
-      throw err;
+  for (let retry = 0; retry < 20; retry += 1) {
+    const uniqueName = `${base}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
+    const uniquePath = path.join(targetDir, uniqueName);
+    if (await tryMoveExclusive(srcPath, uniquePath)) {
+      return {
+        filePath: uniquePath,
+        fileName: path.basename(uniquePath),
+      };
     }
   }
 
-  return {
-    filePath: destPath,
-    fileName: path.basename(destPath),
-  };
+  throw new Error('Unable to allocate unique destination file path.');
 }
 
 module.exports = {

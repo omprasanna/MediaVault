@@ -129,6 +129,8 @@ export default function SettingsPage() {
   }>('/api/system/providers', swrJsonFetcher, { revalidateOnFocus: false });
 
   const user = meData?.user ?? null;
+  const isAdmin = user?.role === 'admin';
+  const isNonAdmin = Boolean(user && user.role !== 'admin');
   const cookies = useMemo(
     () => (Array.isArray(cookiesData?.cookies) ? cookiesData.cookies : []),
     [cookiesData]
@@ -320,6 +322,7 @@ export default function SettingsPage() {
 
   function handleCustomSiteSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!isAdmin) return;
     setCustomSiteTouched(true);
     if (!customSiteSlug) {
       customSiteInputRef.current?.focus();
@@ -329,6 +332,7 @@ export default function SettingsPage() {
   }
 
   function triggerUploadFor(platform: CookiePlatform) {
+    if (!isAdmin) return;
     setTargetPlatform(platform);
     setUploadError(null);
     requestAnimationFrame(() => {
@@ -337,6 +341,7 @@ export default function SettingsPage() {
   }
 
   async function uploadCookieFile(file: File, platform: CookiePlatform) {
+    if (!isAdmin) return;
     setUploadError(null);
 
     if (file.size > MAX_COOKIE_BYTES) {
@@ -423,7 +428,7 @@ export default function SettingsPage() {
   }
 
   async function handleDeleteCookie(platform: CookiePlatform) {
-    if (deletingPlatform) {
+    if (!isAdmin || deletingPlatform) {
       return;
     }
     setDeletingPlatform(platform);
@@ -487,16 +492,32 @@ export default function SettingsPage() {
             </span>
           </div>
           <p className="text-[13px] text-ink-secondary">
-            Stored locally in Docker volume (`0600`). Attached only when explicitly toggled on.
-            Need cookies for another site (Hotstar, Vimeo, Twitch...)? Use{' '}
-            <a
-              href="#cookie-upload"
-              className="font-medium text-accent-text underline underline-offset-4"
-            >
-              Add cookies for any site
-            </a>{' '}
-            below.
+            {isAdmin ? (
+              <>
+                Stored locally in Docker volume (`0600`). Attached only when explicitly toggled on.
+                Need cookies for another site (Hotstar, Vimeo, Twitch...)? Use{' '}
+                <a
+                  href="#cookie-upload"
+                  className="font-medium text-accent-text underline underline-offset-4"
+                >
+                  Add cookies for any site
+                </a>{' '}
+                below.
+              </>
+            ) : (
+              <>
+                Stored locally in Docker volume (`0600`). Attached only when explicitly toggled on.
+              </>
+            )}
           </p>
+          {isNonAdmin && (
+            <p
+              data-testid="cookies-admin-only-notice"
+              className="rounded-lg border border-border-default bg-surface-recessed px-3 py-2 text-xs text-ink-secondary"
+            >
+              Shared platform cookies are managed by an administrator. You can view active slots below and use them when downloading.
+            </p>
+          )}
         </div>
 
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2" data-testid="cookie-cards-grid">
@@ -561,57 +582,60 @@ export default function SettingsPage() {
                   )}
                 </div>
 
-                <div className="flex items-center justify-between gap-2 pt-1">
-                  {installed ? (
-                    <>
+                {isAdmin && (
+                  <div className="flex items-center justify-between gap-2 pt-1">
+                    {installed ? (
+                      <>
+                        <button
+                          type="button"
+                          disabled={isBusy}
+                          onClick={() => triggerUploadFor(platformDef.id)}
+                          data-testid={`replace-cookie-${platformDef.id}`}
+                          className="mv-focus inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-lg border border-border-default bg-surface-elevated px-3 text-[13px] font-medium text-ink-primary shadow-[var(--shadow-xs)] transition-colors hover:border-border-strong hover:bg-surface-high disabled:opacity-50"
+                        >
+                          <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>Replace</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          disabled={isBusy}
+                          onClick={() => void handleDeleteCookie(platformDef.id)}
+                          aria-label={`Delete ${platformDef.label} cookies`}
+                          title={`Delete ${platformDef.label} cookies`}
+                          data-testid={`delete-cookie-${platformDef.id}`}
+                          className="mv-focus inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-border-default bg-surface-elevated text-ink-secondary shadow-[var(--shadow-xs)] transition-colors hover:border-failed-border hover:bg-failed-bg hover:text-failed disabled:opacity-50"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                        </button>
+                      </>
+                    ) : (
                       <button
                         type="button"
                         disabled={isBusy}
                         onClick={() => triggerUploadFor(platformDef.id)}
-                        data-testid={`replace-cookie-${platformDef.id}`}
-                        className="mv-focus inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-lg border border-border-default bg-surface-elevated px-3 text-[13px] font-medium text-ink-primary shadow-[var(--shadow-xs)] transition-colors hover:border-border-strong hover:bg-surface-high disabled:opacity-50"
+                        data-testid={`upload-cookie-${platformDef.id}`}
+                        className="mv-focus inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-lg bg-accent px-3 text-[13px] font-semibold text-on-accent shadow-[var(--shadow-xs)] transition-colors hover:bg-accent-hover disabled:opacity-50"
                       >
-                        <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
-                        <span>Replace</span>
+                        <Upload className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>Upload cookies.txt</span>
                       </button>
-
-                      <button
-                        type="button"
-                        disabled={isBusy}
-                        onClick={() => void handleDeleteCookie(platformDef.id)}
-                        aria-label={`Delete ${platformDef.label} cookies`}
-                        title={`Delete ${platformDef.label} cookies`}
-                        data-testid={`delete-cookie-${platformDef.id}`}
-                        className="mv-focus inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-border-default bg-surface-elevated text-ink-secondary shadow-[var(--shadow-xs)] transition-colors hover:border-failed-border hover:bg-failed-bg hover:text-failed disabled:opacity-50"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      type="button"
-                      disabled={isBusy}
-                      onClick={() => triggerUploadFor(platformDef.id)}
-                      data-testid={`upload-cookie-${platformDef.id}`}
-                      className="mv-focus inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-lg bg-accent px-3 text-[13px] font-semibold text-on-accent shadow-[var(--shadow-xs)] transition-colors hover:bg-accent-hover disabled:opacity-50"
-                    >
-                      <Upload className="h-3.5 w-3.5" aria-hidden="true" />
-                      <span>Upload cookies.txt</span>
-                    </button>
-                  )}
-                </div>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })}
         </div>
       </section>
 
-      {/* Section 2: Upload Dropzone */}
-      <section
-        id="cookie-upload"
-        aria-labelledby={dropzoneHeadingId}
-        className="scroll-mt-20 flex flex-col gap-4"
-      >
+      {/* Section 2: Upload Dropzone (Admin) / Saved Additional Site Cookies (Read-only) */}
+      {isAdmin ? (
+        <section
+          id="cookie-upload"
+          aria-labelledby={dropzoneHeadingId}
+          className="scroll-mt-20 flex flex-col gap-4"
+        >
         <div className="flex items-center justify-between gap-2">
           <h2
             id={dropzoneHeadingId}
@@ -923,7 +947,38 @@ export default function SettingsPage() {
             </button>
           </div>
         )}
-      </section>
+        </section>
+      ) : isNonAdmin && extraInstalledCookies.length > 0 ? (
+        <section
+          aria-label="Additional saved site cookies"
+          className="flex flex-col gap-2"
+          data-testid="custom-cookie-list"
+        >
+          <h3 className="text-xs font-semibold uppercase tracking-[0.02em] text-ink-muted">
+            Saved site cookies
+          </h3>
+          <ul className="divide-y divide-border-subtle rounded-xl border border-border-default bg-surface shadow-[var(--shadow-xs)]">
+            {extraInstalledCookies.map((entry) => (
+              <li
+                key={entry.platform}
+                data-testid={`custom-cookie-row-${entry.platform}`}
+                className="flex flex-wrap items-center justify-between gap-2 px-3 py-2"
+              >
+                <div className="flex min-w-0 flex-col">
+                  <span className="truncate font-mono text-[13px] font-medium text-ink-primary">
+                    {entry.platform}
+                  </span>
+                  <span className="font-mono text-[11px] text-ink-muted">
+                    {entry.isValid === false
+                      ? 'Session validation failed'
+                      : formatRelativeTime(entry.updatedAt)}
+                  </span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
 
       {/* Section 2.5: How to Access Age-Restricted Videos Guide */}
       <section

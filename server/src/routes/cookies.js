@@ -3,6 +3,7 @@ const fs = require('fs');
 const multer = require('multer');
 const path = require('path');
 const Cookie = require('../models/Cookie');
+const { requireAdmin } = require('../middleware/auth');
 const { MAX_COOKIE_BYTES, validateNetscapeCookies } = require('../utils/cookieValidator');
 const { AppError } = require('../utils/errors');
 const { ALLOWED_PLATFORMS, canonicalizePlatformSlug, isValidPlatformSlug } = require('../utils/ytdlp');
@@ -128,6 +129,7 @@ router.get('/', async (_req, res, next) => {
  */
 router.post(
   '/:platform',
+  requireAdmin,
   express.text({ type: 'text/plain', limit: '512kb' }),
   handleUploadMiddleware,
   async (req, res, next) => {
@@ -173,7 +175,7 @@ router.post(
  * DELETE /api/cookies/:platform
  * Deletes the platform cookie file from disk and clears its MongoDB record.
  */
-router.delete('/:platform', async (req, res, next) => {
+router.delete('/:platform', requireAdmin, async (req, res, next) => {
   try {
     const platform = validatePlatformParam(req.params.platform);
     const cookiePath = path.join(getCookiesDir(), `${platform}.txt`);

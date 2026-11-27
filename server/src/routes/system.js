@@ -5,6 +5,7 @@ const mongoose = require('mongoose');
 const path = require('path');
 const { promisify } = require('util');
 const Job = require('../models/Job');
+const { requireAdmin } = require('../middleware/auth');
 const { remoteTunnel } = require('../utils/remoteTunnel');
 const { parseDownloadTtlMinutes } = require('../utils/workerHelpers');
 const { AppError } = require('../utils/errors');
@@ -15,11 +16,11 @@ const router = express.Router();
 let cachedToolVersionsPromise = null;
 let cachedExtractorsPromise = null;
 
-router.get('/remote', (_req, res) => {
+router.get('/remote', requireAdmin, (_req, res) => {
   return res.status(200).json({ tunnel: remoteTunnel.getStatus() });
 });
 
-router.post('/remote', async (_req, res, next) => {
+router.post('/remote', requireAdmin, async (_req, res, next) => {
   try {
     const tunnel = await remoteTunnel.start();
     return res.status(200).json({ tunnel });
@@ -30,7 +31,7 @@ router.post('/remote', async (_req, res, next) => {
   }
 });
 
-router.delete('/remote', async (_req, res, next) => {
+router.delete('/remote', requireAdmin, async (_req, res, next) => {
   try {
     const tunnel = await remoteTunnel.stop();
     return res.status(200).json({ tunnel });

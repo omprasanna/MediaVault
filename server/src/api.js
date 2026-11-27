@@ -4,6 +4,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const { connectDB, disconnectDB } = require('./config/db');
 const { requireAuth, validateJwtSecret } = require('./middleware/auth');
+const Job = require('./models/Job');
 const User = require('./models/User');
 const { closeMediaQueue } = require('./queues/mediaQueue');
 const authRouter = require('./routes/auth');
@@ -50,6 +51,7 @@ async function start() {
   validateJwtSecret();
   await connectDB();
   await User.createIndexes();
+  await Job.ensureNonTtlExpiresIndex();
   server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`MediaVault API listening on http://0.0.0.0:${PORT}`);
   });

@@ -13,6 +13,7 @@ const {
   createRedisConnection,
 } = mediaQueue;
 const { AppError } = require('./utils/errors');
+const { updateBatchRollup } = require('./utils/batchRollup');
 const { sanitizeFilename } = require('./utils/formatMapper');
 const { resolvePublicUrl } = require('./utils/ssrf');
 const {
@@ -52,29 +53,89 @@ let workerInstance = null;
 let workerConnection = null;
 let controlSubscriber = null;
 
-function isSafeDownloadPath(filePath) {
+function isSafeDownloadPath(filePath, downloadsDir = DOWNLOADS_DIR) {
   if (!filePath || typeof filePath !== 'string') return false;
+  const resolvedDir = path.resolve(downloadsDir);
   const resolved = path.resolve(filePath);
-  return resolved.startsWith(`${DOWNLOADS_DIR}${path.sep}`);
+  return resolved.startsWith(`${resolvedDir}${path.sep}`);
 }
 
-async function unlinkIfSafe(filePath) {
-  if (!isSafeDownloadPath(filePath)) return;
+async function unlinkIfSafe(filePath, downloadsDir = DOWNLOADS_DIR) {
+  if (!isSafeDownloadPath(filePath, downloadsDir)) return false;
   try {
     await fs.promises.unlink(filePath);
+    return true;
   } catch (err) {
-    if (err.code !== 'ENOENT') {
-      console.error(`Failed to unlink ${filePath}:`, err.message);
+    if (err.code === 'ENOENT') {
+      return true;
     }
+    console.error(`Failed to unlink ${filePath}:`, err.message);
+    return false;
   }
 }
 
-async function cleanupPartialFiles(jobId) {
+async function removeEmptyPlaylistDirIfSafe(filePath, downloadsDir = DOWNLOADS_DIR) {
+  if (!isSafeDownloadPath(filePath, downloadsDir)) return;
+  const resolvedDir = path.resolve(downloadsDir);
+  const parentDir = path.dirname(path.resolve(filePath));
+  if (
+    parentDir !== resolvedDir &&
+    parentDir.startsWith(`${resolvedDir}${path.sep}`) &&
+    path.basename(parentDir) !== '.mediavault-tmp'
+  ) {
+    await fs.promises.rmdir(parentDir).catch(() => {});
+  }
+}
+
+async function collectExpiredCandidateFiles(downloadsDir, nowMs, downloadTtlMs) {
+  const expiredFiles = [];
+  const entries = await fs.promises.readdir(downloadsDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name === '.gitkeep' || entry.name.startsWith('.')) {
+      continue;
+    }
+    const fullPath = path.join(downloadsDir, entry.name);
+    if (entry.isFile()) {
+      try {
+        const stats = await fs.promises.stat(fullPath);
+        if (stats.isFile() && nowMs - stats.mtimeMs > downloadTtlMs) {
+          expiredFiles.push(fullPath);
+        }
+      } catch {
+        // Ignore transient stat errors
+      }
+    } else if (entry.isDirectory()) {
+      try {
+        const subEntries = await fs.promises.readdir(fullPath, { withFileTypes: true });
+        for (const subEntry of subEntries) {
+          if (!subEntry.isFile() || subEntry.name.startsWith('.')) {
+            continue;
+          }
+          const subPath = path.join(fullPath, subEntry.name);
+          try {
+            const stats = await fs.promises.stat(subPath);
+            if (stats.isFile() && nowMs - stats.mtimeMs > downloadTtlMs) {
+              expiredFiles.push(subPath);
+            }
+          } catch {
+            // Ignore transient stat errors
+          }
+        }
+      } catch {
+        // Ignore transient directory errors
+      }
+    }
+  }
+  return expiredFiles;
+}
+
+async function cleanupPartialFiles(jobId, downloadsDir = DOWNLOADS_DIR) {
+  const tmpDir = path.join(path.resolve(downloadsDir), '.mediavault-tmp');
   try {
-    const entries = await fs.promises.readdir(TMP_DOWNLOADS_DIR);
+    const entries = await fs.promises.readdir(tmpDir);
     for (const entry of entries) {
       if (entry.startsWith(`${jobId}.`)) {
-        await unlinkIfSafe(path.join(TMP_DOWNLOADS_DIR, entry));
+        await unlinkIfSafe(path.join(tmpDir, entry), downloadsDir);
       }
     }
   } catch (err) {
@@ -84,8 +145,9 @@ async function cleanupPartialFiles(jobId) {
   }
 }
 
-async function findJobOutputFile(jobId, preferredContainer) {
-  const preferredPath = path.join(TMP_DOWNLOADS_DIR, `${jobId}.${preferredContainer}`);
+async function findJobOutputFile(jobId, preferredContainer, downloadsDir = DOWNLOADS_DIR) {
+  const tmpDir = path.join(path.resolve(downloadsDir), '.mediavault-tmp');
+  const preferredPath = path.join(tmpDir, `${jobId}.${preferredContainer}`);
   try {
     const stats = await fs.promises.stat(preferredPath);
     if (stats.isFile()) {
@@ -95,7 +157,7 @@ async function findJobOutputFile(jobId, preferredContainer) {
     // Fall back to scanning prefix in case yt-dlp resolved a different extension.
   }
 
-  const entries = await fs.promises.readdir(TMP_DOWNLOADS_DIR);
+  const entries = await fs.promises.readdir(tmpDir);
   for (const entry of entries) {
     if (
       entry.startsWith(`${jobId}.`) &&
@@ -103,7 +165,7 @@ async function findJobOutputFile(jobId, preferredContainer) {
       !entry.endsWith('.ytdl') &&
       !entry.includes('.temp.')
     ) {
-      const candidate = path.join(TMP_DOWNLOADS_DIR, entry);
+      const candidate = path.join(tmpDir, entry);
       const stats = await fs.promises.stat(candidate);
       if (stats.isFile()) {
         return candidate;
@@ -118,104 +180,95 @@ async function findJobOutputFile(jobId, preferredContainer) {
  * Cleans stale staging files from `.mediavault-tmp` and, when `DOWNLOAD_TTL_MINUTES > 0`,
  * removes expired finished files from `/data/downloads` and marks jobs `expired`.
  */
-async function runStorageCleanup() {
+async function runStorageCleanup({
+  downloadsDir = DOWNLOADS_DIR,
+  downloadTtlMs = DOWNLOAD_TTL_MS,
+} = {}) {
   if (isCleanupRunning) return;
   isCleanupRunning = true;
 
   try {
-    await fs.promises.mkdir(DOWNLOADS_DIR, { recursive: true });
-    await fs.promises.mkdir(TMP_DOWNLOADS_DIR, { recursive: true });
+    const resolvedDownloadsDir = path.resolve(downloadsDir);
+    const tmpDir = path.join(resolvedDownloadsDir, '.mediavault-tmp');
+    await fs.promises.mkdir(resolvedDownloadsDir, { recursive: true });
+    await fs.promises.mkdir(tmpDir, { recursive: true });
     const nowMs = Date.now();
 
-    const tmpEntries = await fs.promises.readdir(TMP_DOWNLOADS_DIR);
+    const tmpEntries = await fs.promises.readdir(tmpDir);
     for (const entry of tmpEntries) {
       if (entry === '.gitkeep') {
         continue;
       }
-      const tmpPath = path.join(TMP_DOWNLOADS_DIR, entry);
+      const tmpPath = path.join(tmpDir, entry);
       try {
         const stats = await fs.promises.stat(tmpPath);
         if (stats.isFile() && nowMs - stats.mtimeMs > ORPHAN_TMP_MAX_AGE_MS) {
-          await unlinkIfSafe(tmpPath);
+          await unlinkIfSafe(tmpPath, resolvedDownloadsDir);
         }
       } catch {
         // Ignore transient temp file stat errors
       }
     }
 
-    if (DOWNLOAD_TTL_MS <= 0) {
+    if (downloadTtlMs <= 0) {
       return;
     }
 
+    const affectedBatchIds = new Set();
     const now = new Date();
     const expiredJobs = await Job.find({
       status: 'ready',
       expiresAt: { $ne: null, $lte: now },
-    }).select('_id filePath');
+    })
+      .select('_id filePath batchId')
+      .lean();
 
     for (const job of expiredJobs) {
       if (job.filePath) {
-        await unlinkIfSafe(job.filePath);
+        const removed = await unlinkIfSafe(job.filePath, resolvedDownloadsDir);
+        if (!removed) continue;
+        await removeEmptyPlaylistDirIfSafe(job.filePath, resolvedDownloadsDir);
       }
       await Job.findByIdAndUpdate(job._id, {
         status: 'expired',
         filePath: null,
       });
+      if (job.batchId) {
+        affectedBatchIds.add(job.batchId);
+      }
     }
 
-    const entries = await fs.promises.readdir(DOWNLOADS_DIR);
-    for (const entry of entries) {
-      if (entry === '.gitkeep' || entry.startsWith('.')) {
-        continue;
+    const orphanCandidates = await collectExpiredCandidateFiles(
+      resolvedDownloadsDir,
+      nowMs,
+      downloadTtlMs
+    );
+    for (const fullPath of orphanCandidates) {
+      const removed = await unlinkIfSafe(fullPath, resolvedDownloadsDir);
+      if (!removed) continue;
+      await removeEmptyPlaylistDirIfSafe(fullPath, resolvedDownloadsDir);
+      const orphanJobs = await Job.find({ filePath: fullPath })
+        .select('batchId')
+        .lean();
+      for (const orphanJob of orphanJobs) {
+        if (orphanJob.batchId) {
+          affectedBatchIds.add(orphanJob.batchId);
+        }
       }
-      const fullPath = path.join(DOWNLOADS_DIR, entry);
-      let stats;
-      try {
-        stats = await fs.promises.stat(fullPath);
-      } catch {
-        continue;
-      }
+      await Job.updateMany(
+        { filePath: fullPath },
+        { status: 'expired', filePath: null }
+      );
+    }
 
-      if (stats.isFile() && nowMs - stats.mtimeMs > DOWNLOAD_TTL_MS) {
-        await unlinkIfSafe(fullPath);
-        await Job.updateMany(
-          { filePath: fullPath },
-          { status: 'expired', filePath: null }
-        );
-      }
+    for (const batchId of affectedBatchIds) {
+      await updateBatchRollup(batchId).catch(() => {});
     }
   } catch (err) {
     console.error('Storage cleanup sweep error:', err.message);
   } finally {
     isCleanupRunning = false;
   }
-}
-
-async function updateBatchRollup(batchId) {
-  if (!batchId) return;
-  const batch = await Batch.findOne({ batchId });
-  if (!batch) return;
-
-  const [completedItems, failedItems] = await Promise.all([
-    Job.countDocuments({ batchId, status: 'ready' }),
-    Job.countDocuments({ batchId, status: { $in: ['failed', 'cancelled'] } }),
-  ]);
-
-  let status = 'processing';
-  if (completedItems + failedItems >= batch.totalItems) {
-    if (failedItems === 0) {
-      status = 'completed';
-    } else if (completedItems === 0) {
-      status = 'failed';
-    } else {
-      status = 'partial_failure';
-    }
-  }
-
-  await Batch.updateOne(
-    { _id: batch._id },
-    { completedItems, failedItems, status }
-  );
 }
 
 function runYtDlpDownload({
@@ -386,6 +439,8 @@ async function processJob(bullJob, deps) {
   }
 
   const runtimeDeps = deps && typeof deps === 'object' ? deps : {};
+  const downloadsDir = path.resolve(runtimeDeps.downloadsDir || DOWNLOADS_DIR);
+  const tmpDownloadsDir = path.join(downloadsDir, '.mediavault-tmp');
   const resolvePublicUrlFn = runtimeDeps.resolvePublicUrl || resolvePublicUrl;
   const createPinnedSsrfProxyFn = runtimeDeps.createPinnedSsrfProxy || createPinnedSsrfProxy;
   const runYtDlpDownloadFn = runtimeDeps.runYtDlpDownload || runYtDlpDownload;
@@ -400,14 +455,15 @@ async function processJob(bullJob, deps) {
   let lastDbProgress = maxProgress;
   let knownTotalSizeBytes = Math.max(0, Number(job.totalSizeBytes || job.fileSizeBytes || 0));
   let lastDbTotalSizeBytes = knownTotalSizeBytes;
-  let lastCacheTotalSizeBytes = knownTotalSizeBytes;
   const streamSizeBytes = new Map();
   let lastDbWriteMs = 0;
-  let lastCacheWriteMs = 0;
   let reachedMuxingPhase = false;
   let pausedByRequest = false;
   let cancelledForRetry = false;
   let cancelledByRequest = false;
+  let workerOwnsActiveJob = false;
+  let ownershipLost = false;
+  let progressWriteChain = Promise.resolve(true);
   let activeDownloadController = null;
 
   activeJobControllers.set(jobId, {
@@ -427,7 +483,7 @@ async function processJob(bullJob, deps) {
     },
   });
 
-  const publishProgress = async (
+  const publishProgress = (
     {
       status,
       progress,
@@ -437,8 +493,8 @@ async function processJob(bullJob, deps) {
     },
     forceDb = false
   ) => {
-    if (pausedByRequest || cancelledForRetry || cancelledByRequest) {
-      return;
+    if (pausedByRequest || cancelledForRetry || cancelledByRequest || ownershipLost) {
+      return Promise.resolve(false);
     }
 
     const now = Date.now();
@@ -448,50 +504,87 @@ async function processJob(bullJob, deps) {
     if (Number.isFinite(totalSizeBytes) && totalSizeBytes > knownTotalSizeBytes) {
       knownTotalSizeBytes = Math.round(totalSizeBytes);
     }
-    const sizeChangedSinceCache = knownTotalSizeBytes !== lastCacheTotalSizeBytes;
     const sizeChangedSinceDb = knownTotalSizeBytes !== lastDbTotalSizeBytes;
 
-    if (forceDb || statusChanged || sizeChangedSinceCache || now - lastCacheWriteMs >= 400) {
-      lastCacheWriteMs = now;
-      lastCacheTotalSizeBytes = knownTotalSizeBytes;
-      await mediaQueue.setJobProgressCache(jobId, {
-        status: currentStatus,
-        progress: maxProgress,
-        downloadSpeed,
-        eta,
-        totalSizeBytes: knownTotalSizeBytes,
-      }).catch(() => {});
-    }
-
-    if (
+    const shouldWrite =
       forceDb ||
       statusChanged ||
       sizeChangedSinceDb ||
       maxProgress - lastDbProgress >= 2 ||
-      now - lastDbWriteMs >= 1000
-    ) {
-      lastDbProgress = maxProgress;
-      lastDbTotalSizeBytes = knownTotalSizeBytes;
-      lastDbWriteMs = now;
-      await Job.findByIdAndUpdate(jobId, {
-        status: currentStatus,
-        progress: maxProgress,
+      now - lastDbWriteMs >= 500;
+
+    if (!shouldWrite) {
+      return Promise.resolve(true);
+    }
+
+    lastDbProgress = maxProgress;
+    lastDbTotalSizeBytes = knownTotalSizeBytes;
+    lastDbWriteMs = now;
+
+    const nextStatus = currentStatus;
+    const nextProgress = maxProgress;
+    const nextTotalSizeBytes = knownTotalSizeBytes;
+
+    progressWriteChain = progressWriteChain.then(async () => {
+      if (pausedByRequest || cancelledForRetry || cancelledByRequest || ownershipLost) {
+        return false;
+      }
+
+      let updated;
+      try {
+        updated = await Job.findOneAndUpdate(
+          { _id: jobId, status: { $in: ['downloading', 'muxing'] } },
+          {
+            status: nextStatus,
+            progress: nextProgress,
+            downloadSpeed,
+            eta,
+            totalSizeBytes: nextTotalSizeBytes,
+          },
+          { new: true }
+        );
+      } catch {
+        return false;
+      }
+
+      if (!updated) {
+        ownershipLost = true;
+        activeDownloadController?.stop('external');
+        return false;
+      }
+
+      if (pausedByRequest || cancelledForRetry || cancelledByRequest || ownershipLost) {
+        return false;
+      }
+
+      await mediaQueue.setJobProgressCache(jobId, {
+        status: nextStatus,
+        progress: nextProgress,
         downloadSpeed,
         eta,
-        totalSizeBytes: knownTotalSizeBytes,
+        totalSizeBytes: nextTotalSizeBytes,
       }).catch(() => {});
-    }
+
+      return true;
+    });
+
+    return progressWriteChain;
   };
 
   const persistPausedState = async () => {
-    await Job.findByIdAndUpdate(jobId, {
-      status: 'paused',
-      progress: maxProgress,
-      downloadSpeed: null,
-      eta: null,
-      totalSizeBytes: knownTotalSizeBytes,
-      errorMessage: null,
-    }).catch(() => {});
+    await progressWriteChain.catch(() => {});
+    await Job.findOneAndUpdate(
+      { _id: jobId, status: { $in: ['downloading', 'muxing', 'paused'] } },
+      {
+        status: 'paused',
+        progress: maxProgress,
+        downloadSpeed: null,
+        eta: null,
+        totalSizeBytes: knownTotalSizeBytes,
+        errorMessage: null,
+      },
+      { new: true }
+    ).catch(() => {});
     await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
   };
 
@@ -505,11 +598,11 @@ async function processJob(bullJob, deps) {
     });
 
     try {
-      await assertSufficientDiskSpace(DOWNLOADS_DIR);
+      await assertSufficientDiskSpace(downloadsDir);
     } catch (diskErr) {
       if (diskErr instanceof AppError && diskErr.code === 'DISK_FULL') {
-        await runStorageCleanup();
-        await assertSufficientDiskSpace(DOWNLOADS_DIR);
+        await runStorageCleanup({ downloadsDir });
+        await assertSufficientDiskSpace(downloadsDir);
       } else {
         throw diskErr;
       }
@@ -522,7 +615,7 @@ async function processJob(bullJob, deps) {
 
     const latestBeforeSpawn = await Job.findById(jobId).select('status').lean();
     if (cancelledByRequest || !latestBeforeSpawn || latestBeforeSpawn.status === 'cancelled') {
-      await cleanupPartialFiles(jobId);
+      await cleanupPartialFiles(jobId, downloadsDir);
       await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
       return;
     }
@@ -534,13 +627,41 @@ async function processJob(bullJob, deps) {
       return;
     }
 
-    await publishProgress(
-      { status: 'downloading', progress: maxProgress, downloadSpeed: null, eta: null },
-      true
+    const claimedJob = await Job.findOneAndUpdate(
+      { _id: jobId, status: { $in: ['queued', 'downloading'] } },
+      {
+        status: 'downloading',
+        progress: maxProgress,
+        downloadSpeed: null,
+        eta: null,
+        totalSizeBytes: knownTotalSizeBytes,
+      },
+      { new: true }
     );
+    if (!claimedJob || pausedByRequest || cancelledForRetry || cancelledByRequest) {
+      if (cancelledByRequest) {
+        await cleanupPartialFiles(jobId, downloadsDir);
+      } else if (pausedByRequest) {
+        await persistPausedState();
+      }
+      await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
+      return;
+    }
 
-    await fs.promises.mkdir(TMP_DOWNLOADS_DIR, { recursive: true });
-    const outputTemplate = path.join(TMP_DOWNLOADS_DIR, `${jobId}.%(ext)s`);
+    workerOwnsActiveJob = true;
+    lastDbProgress = maxProgress;
+    lastDbTotalSizeBytes = knownTotalSizeBytes;
+    lastDbWriteMs = Date.now();
+    await mediaQueue.setJobProgressCache(jobId, {
+      status: 'downloading',
+      progress: maxProgress,
+      downloadSpeed: null,
+      eta: null,
+      totalSizeBytes: knownTotalSizeBytes,
+    }).catch(() => {});
+
+    await fs.promises.mkdir(tmpDownloadsDir, { recursive: true });
+    const outputTemplate = path.join(tmpDownloadsDir, `${jobId}.%(ext)s`);
     let finalContainer = job.container;
 
     const forceIpv4 = process.env.YTDLP_FORCE_IPV4 !== 'false';
@@ -573,6 +694,8 @@ async function processJob(bullJob, deps) {
             controller.stop('retry');
           } else if (pausedByRequest) {
             controller.stop('paused');
+          } else if (ownershipLost) {
+            controller.stop('external');
           }
         },
         onProgress: ({ percentage, totalSize, downloadSpeed, eta, streamIndex = 0 }) => {
@@ -615,13 +738,15 @@ async function processJob(bullJob, deps) {
     try {
       await executeDownload(finalContainer);
     } catch (downloadErr) {
+      await progressWriteChain.catch(() => {});
+
       if (cancelledByRequest) {
-        await cleanupPartialFiles(jobId);
+        await cleanupPartialFiles(jobId, downloadsDir);
         await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
         return;
       }
-      if (pausedByRequest || cancelledForRetry) {
-        if (pausedByRequest && !cancelledForRetry) {
+      if (pausedByRequest || cancelledForRetry || ownershipLost) {
+        if (pausedByRequest && !cancelledForRetry && !ownershipLost) {
           await persistPausedState();
         }
         return;
@@ -647,13 +772,13 @@ async function processJob(bullJob, deps) {
       console.warn(
         `Job ${jobId}: muxing into ${finalContainer} failed (${downloadErr.message}); falling back to MKV stream-copy.`
       );
-      await cleanupPartialFiles(jobId);
+      await cleanupPartialFiles(jobId, downloadsDir);
       finalContainer = 'mkv';
       reachedMuxingPhase = false;
       maxProgress = 0;
       lastDbProgress = 0;
       streamSizeBytes.clear();
-      await publishProgress(
+      const fallbackStillActive = await publishProgress(
         {
           status: 'downloading',
           progress: 0,
@@ -663,15 +788,20 @@ async function processJob(bullJob, deps) {
         },
         true
       );
+      if (!fallbackStillActive) {
+        return;
+      }
       await executeDownload('mkv');
     }
 
+    await progressWriteChain.catch(() => {});
+
     if (cancelledByRequest) {
-      await cleanupPartialFiles(jobId);
+      await cleanupPartialFiles(jobId, downloadsDir);
       await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
       return;
     }
-    if (cancelledForRetry) {
+    if (cancelledForRetry || ownershipLost) {
       return;
     }
 
@@ -681,12 +811,12 @@ async function processJob(bullJob, deps) {
       return;
     }
     if (!postRunDoc || postRunDoc.status === 'cancelled') {
-      await cleanupPartialFiles(jobId);
+      await cleanupPartialFiles(jobId, downloadsDir);
       await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
       return;
     }
 
-    const outputPath = await findJobOutputFile(jobId, finalContainer);
+    const outputPath = await findJobOutputFile(jobId, finalContainer, downloadsDir);
     if (!outputPath) {
       throw new Error('Completed media file was not found in downloads directory.');
     }
@@ -696,13 +826,13 @@ async function processJob(bullJob, deps) {
       finalContainer = detectedExt;
     }
 
-    let targetDir = DOWNLOADS_DIR;
+    let targetDir = downloadsDir;
     if (job.batchId) {
       const batch = await Batch.findOne({ batchId: job.batchId })
         .select('playlistTitle')
         .lean();
       if (batch && batch.playlistTitle) {
-        targetDir = path.join(DOWNLOADS_DIR, sanitizeFolderName(batch.playlistTitle));
+        targetDir = path.join(downloadsDir, sanitizeFolderName(batch.playlistTitle));
       }
     }
 
@@ -711,37 +841,51 @@ async function processJob(bullJob, deps) {
     const stats = await fs.promises.stat(moved.filePath);
     const expiresAt = DOWNLOAD_TTL_MS > 0 ? new Date(Date.now() + DOWNLOAD_TTL_MS) : null;
 
-    const updatedDoc = await Job.findByIdAndUpdate(jobId, {
-      status: 'ready',
-      progress: 100,
-      downloadSpeed: null,
-      eta: '00:00',
-      container: finalContainer,
-      filePath: moved.filePath,
-      fileName: moved.fileName,
-      fileSizeBytes: stats.size,
-      totalSizeBytes: stats.size,
-      errorMessage: null,
-      expiresAt,
-    });
+    const updatedDoc = await Job.findOneAndUpdate(
+      { _id: jobId, status: { $in: ['downloading', 'muxing'] } },
+      {
+        status: 'ready',
+        progress: 100,
+        downloadSpeed: null,
+        eta: '00:00',
+        container: finalContainer,
+        filePath: moved.filePath,
+        fileName: moved.fileName,
+        fileSizeBytes: stats.size,
+        totalSizeBytes: stats.size,
+        errorMessage: null,
+        expiresAt,
+      }
+    );
 
     if (!updatedDoc || cancelledByRequest) {
-      await unlinkIfSafe(moved.filePath);
-      await cleanupPartialFiles(jobId);
+      await unlinkIfSafe(moved.filePath, downloadsDir);
+      await removeEmptyPlaylistDirIfSafe(moved.filePath, downloadsDir);
+      if (cancelledByRequest) await cleanupPartialFiles(jobId, downloadsDir);
       await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
+      await updateBatchRollup(job.batchId).catch(() => {});
       return;
     }
 
     await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
-    await updateBatchRollup(job.batchId);
+    try {
+      await updateBatchRollup(job.batchId);
+    } catch (rollupErr) {
+      console.error(
+        `Job ${jobId} ready, but batch rollup update failed:`,
+        rollupErr.message
+      );
+    }
     console.log(`Job ${jobId} ready (${finalContainer}, ${stats.size} bytes)`);
   } catch (err) {
+    await progressWriteChain.catch(() => {});
+
     if (cancelledByRequest) {
-      await cleanupPartialFiles(jobId);
+      await cleanupPartialFiles(jobId, downloadsDir);
       await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
       return;
     }
-    if (cancelledForRetry) {
+    if (cancelledForRetry || ownershipLost) {
       return;
     }
     if (pausedByRequest) {
@@ -749,15 +893,28 @@ async function processJob(bullJob, deps) {
       return;
     }
 
+    const activeFailureStatuses = workerOwnsActiveJob
+      ? ['downloading', 'muxing']
+      : ['queued'];
+
     // Preserve `.part` files in `.mediavault-tmp` so clicking Retry resumes via `--continue`.
-    await Job.findByIdAndUpdate(jobId, {
-      status: 'failed',
-      progress: maxProgress,
-      downloadSpeed: null,
-      eta: null,
-      totalSizeBytes: knownTotalSizeBytes,
-      errorMessage: err.message || 'Download job failed.',
-    }).catch(() => {});
+    const failedDoc = await Job.findOneAndUpdate(
+      { _id: jobId, status: { $in: activeFailureStatuses } },
+      {
+        status: 'failed',
+        progress: maxProgress,
+        downloadSpeed: null,
+        eta: null,
+        totalSizeBytes: knownTotalSizeBytes,
+        errorMessage: err.message || 'Download job failed.',
+      },
+      { new: true }
+    ).catch(() => null);
+
+    if (!failedDoc) {
+      return;
+    }
+
     await mediaQueue.clearJobProgressCache(jobId).catch(() => {});
     await updateBatchRollup(job.batchId).catch(() => {});
     console.error(`Job ${jobId} failed:`, err.message);
@@ -777,6 +934,14 @@ async function start() {
   await fs.promises.mkdir(DOWNLOADS_DIR, { recursive: true });
   await fs.promises.mkdir(TMP_DOWNLOADS_DIR, { recursive: true });
   await connectDB();
+  await Job.ensureNonTtlExpiresIndex();
+
+  const interruptedJobs = await Job.find({ status: { $in: ['downloading', 'muxing'] } })
+    .select('batchId')
+    .lean();
+  const recoveryBatchIds = Array.from(
+    new Set(interruptedJobs.map((job) => job.batchId).filter(Boolean))
+  );
 
   const recoveryResult = await Job.updateMany(
     { status: { $in: ['downloading', 'muxing'] } },
@@ -788,6 +953,9 @@ async function start() {
     }
   );
   if (recoveryResult.modifiedCount > 0) {
+    for (const batchId of recoveryBatchIds) {
+      await updateBatchRollup(batchId).catch(() => {});
+    }
     console.log(`Recovered ${recoveryResult.modifiedCount} interrupted job(s) for retry.`);
   }
 
@@ -883,5 +1051,6 @@ if (require.main === module) {
 
 module.exports = {
   processJob,
+  runStorageCleanup,
   runYtDlpDownload,
 };

@@ -38,6 +38,10 @@ const batchSchema = new mongoose.Schema(
       enum: ['processing', 'completed', 'partial_failure', 'failed'],
       default: 'processing',
     },
+    rollupVersion: {
+      type: Number,
+      default: 0,
+    },
   },
   { timestamps: true }
 );

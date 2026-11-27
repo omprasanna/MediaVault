@@ -12,16 +12,21 @@ const { Duplex, PassThrough } = require('node:stream');
 const jwt = require('jsonwebtoken');
 const { MongoServerError } = require('mongodb');
 
+const Cookie = require('../src/models/Cookie');
 const Job = require('../src/models/Job');
 const User = require('../src/models/User');
 const mediaQueue = require('../src/queues/mediaQueue');
 const {
   getJwtSecret,
+  requireAdmin,
   requireAuth,
   validateJwtSecret,
 } = require('../src/middleware/auth');
 const authRouter = require('../src/routes/auth');
+const cookiesRouter = require('../src/routes/cookies');
 const proxyRouter = require('../src/routes/proxy');
+const systemRouter = require('../src/routes/system');
+const { remoteTunnel } = require('../src/utils/remoteTunnel');
 const {
   assertPublicUrl,
   createPinnedLookup,
@@ -1484,6 +1489,7 @@ test('buildYtDlpJobArgs and worker processJob route downloads through pinned SSR
 
   const origFindById = Job.findById;
   const origFindByIdAndUpdate = Job.findByIdAndUpdate;
+  const origFindOneAndUpdate = Job.findOneAndUpdate;
   const origStatfs = fs.promises.statfs;
   const origSetCache = mediaQueue.setJobProgressCache;
   const origClearCache = mediaQueue.clearJobProgressCache;
@@ -1519,6 +1525,16 @@ test('buildYtDlpJobArgs and worker processJob route downloads through pinned SSR
       });
     Job.findByIdAndUpdate = async (_id, update) => {
       statusUpdates.push(update);
+      if (update && update.status) jobDoc.status = update.status;
+      return jobDoc;
+    };
+    Job.findOneAndUpdate = async (filter, update) => {
+      const allowed = filter?.status?.$in;
+      if (Array.isArray(allowed) && !allowed.includes(jobDoc.status)) {
+        return null;
+      }
+      statusUpdates.push(update);
+      if (update && update.status) jobDoc.status = update.status;
       return jobDoc;
     };
     fs.promises.statfs = async () => ({ bavail: 1000000, bsize: 4096 * 1024 });
@@ -1572,6 +1588,7 @@ test('buildYtDlpJobArgs and worker processJob route downloads through pinned SSR
     else process.env.DOWNLOADS_DIR = prevDownloadsDir;
     Job.findById = origFindById;
     Job.findByIdAndUpdate = origFindByIdAndUpdate;
+    Job.findOneAndUpdate = origFindOneAndUpdate;
     fs.promises.statfs = origStatfs;
     mediaQueue.setJobProgressCache = origSetCache;
     mediaQueue.clearJobProgressCache = origClearCache;
@@ -1671,5 +1688,234 @@ test('real yt-dlp binary cannot reach loopback, IMDS, or post-validation redirec
   } finally {
     await proxy.close();
     await new Promise((resolve) => loopbackServer.close(resolve));
+  }
+});
+
+function invokeRouteStack(router, method, routePath, reqOverrides = {}) {
+  const layer = router.stack.find(
+    (l) => l.route && l.route.path === routePath && l.route.methods[method]
+  );
+  assert.ok(layer, `Expected ${method.toUpperCase()} ${routePath} route handler`);
+
+  const req = {
+    params: {},
+    query: {},
+    headers: {},
+    is: () => false,
+    ...reqOverrides,
+  };
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const res = {
+      statusCode: 200,
+      status(code) {
+        res.statusCode = code;
+        return res;
+      },
+      json(payload) {
+        if (!settled) {
+          settled = true;
+          resolve({ statusCode: res.statusCode, payload, error: null });
+        }
+        return res;
+      },
+    };
+
+    const handlers = layer.route.stack.map((entry) => entry.handle);
+    let idx = 0;
+
+    function dispatch(err) {
+      if (settled) return;
+      if (err) {
+        settled = true;
+        resolve({ statusCode: res.statusCode, payload: null, error: err });
+        return;
+      }
+      const fn = handlers[idx++];
+      if (!fn) {
+        settled = true;
+        resolve({ statusCode: res.statusCode, payload: null, error: null });
+        return;
+      }
+      Promise.resolve(fn(req, res, dispatch)).catch((caught) => {
+        if (!settled) {
+          settled = true;
+          resolve({ statusCode: res.statusCode, payload: null, error: caught });
+        }
+      });
+    }
+
+    dispatch();
+  });
+}
+
+test('requireAdmin rejects missing or non-admin users with 403 and allows admin', () => {
+  for (const req of [{}, { user: { id: 'u1', role: 'user' } }]) {
+    let capturedErr = null;
+    requireAdmin(req, {}, (err) => {
+      capturedErr = err;
+    });
+    assert.equal(capturedErr.statusCode, 403);
+    assert.equal(capturedErr.code, 'FORBIDDEN');
+  }
+
+  let adminErr;
+  requireAdmin({ user: { id: 'a1', role: 'admin' } }, {}, (err) => {
+    adminErr = err;
+  });
+  assert.equal(adminErr, undefined);
+});
+
+test('cookie mutation routes enforce requireAdmin while GET /api/cookies remains readable for authenticated users', async () => {
+  const prevCookiesDir = process.env.COOKIES_DIR;
+  const tempCookiesDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'mv-cookies-authz-'));
+  process.env.COOKIES_DIR = tempCookiesDir;
+
+  const origFind = Cookie.find;
+  const origFindOneAndUpdate = Cookie.findOneAndUpdate;
+  const origDeleteOne = Cookie.deleteOne;
+
+  let upsertCalls = 0;
+  let deleteCalls = 0;
+
+  Cookie.find = () => ({
+    select: () => ({
+      lean: async () => [],
+    }),
+  });
+  Cookie.findOneAndUpdate = async (filter, update) => {
+    upsertCalls += 1;
+    return { ...filter, ...update };
+  };
+  Cookie.deleteOne = async () => {
+    deleteCalls += 1;
+    return { deletedCount: 1 };
+  };
+
+  const validNetscape =
+    '# Netscape HTTP Cookie File\n' +
+    '.youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\tsample-token\n';
+  const regularUser = { id: '65b2d8e9f1a23c0012a40001', email: 'user@mediavault.local', role: 'user' };
+  const adminUser = { id: '65b2d8e9f1a23c0012a45bc8', email: 'admin@mediavault.local', role: 'admin' };
+
+  try {
+    // Authenticated non-admin can list cookie slot status metadata
+    const listRes = await invokeRouteStack(cookiesRouter, 'get', '/', { user: regularUser });
+    assert.equal(listRes.error, null);
+    assert.equal(listRes.statusCode, 200);
+    assert.ok(Array.isArray(listRes.payload.cookies));
+
+    // Non-admin cannot upload/replace cookies
+    const postDenied = await invokeRouteStack(cookiesRouter, 'post', '/:platform', {
+      user: regularUser,
+      params: { platform: 'youtube' },
+      headers: { 'content-type': 'application/json' },
+      body: { cookieText: validNetscape },
+    });
+    assert.equal(postDenied.error.statusCode, 403);
+    assert.equal(postDenied.error.code, 'FORBIDDEN');
+    assert.equal(upsertCalls, 0);
+    assert.equal(fs.existsSync(path.join(tempCookiesDir, 'youtube.txt')), false);
+
+    // Non-admin cannot delete cookies (seed file first as admin)
+    const postAdmin = await invokeRouteStack(cookiesRouter, 'post', '/:platform', {
+      user: adminUser,
+      params: { platform: 'youtube' },
+      headers: { 'content-type': 'application/json' },
+      body: { cookieText: validNetscape },
+    });
+    assert.equal(postAdmin.error, null);
+    assert.equal(postAdmin.statusCode, 200);
+    assert.equal(upsertCalls, 1);
+    assert.equal(fs.existsSync(path.join(tempCookiesDir, 'youtube.txt')), true);
+
+    const deleteDenied = await invokeRouteStack(cookiesRouter, 'delete', '/:platform', {
+      user: regularUser,
+      params: { platform: 'youtube' },
+    });
+    assert.equal(deleteDenied.error.statusCode, 403);
+    assert.equal(deleteDenied.error.code, 'FORBIDDEN');
+    assert.equal(deleteCalls, 0);
+    assert.equal(fs.existsSync(path.join(tempCookiesDir, 'youtube.txt')), true);
+
+    // Admin can delete cookies
+    const deleteAdmin = await invokeRouteStack(cookiesRouter, 'delete', '/:platform', {
+      user: adminUser,
+      params: { platform: 'youtube' },
+    });
+    assert.equal(deleteAdmin.error, null);
+    assert.equal(deleteAdmin.statusCode, 200);
+    assert.equal(deleteCalls, 1);
+    assert.equal(fs.existsSync(path.join(tempCookiesDir, 'youtube.txt')), false);
+  } finally {
+    Cookie.find = origFind;
+    Cookie.findOneAndUpdate = origFindOneAndUpdate;
+    Cookie.deleteOne = origDeleteOne;
+    if (prevCookiesDir === undefined) delete process.env.COOKIES_DIR;
+    else process.env.COOKIES_DIR = prevCookiesDir;
+    await fs.promises.rm(tempCookiesDir, { recursive: true, force: true });
+  }
+});
+
+test('remote tunnel routes under /api/system/remote require admin role', async () => {
+  const origGetStatus = remoteTunnel.getStatus;
+  const origStart = remoteTunnel.start;
+  const origStop = remoteTunnel.stop;
+
+  let getStatusCalls = 0;
+  let startCalls = 0;
+  let stopCalls = 0;
+
+  remoteTunnel.getStatus = () => {
+    getStatusCalls += 1;
+    return { status: 'offline', url: null };
+  };
+  remoteTunnel.start = async () => {
+    startCalls += 1;
+    return { status: 'online', url: 'https://admin-only.trycloudflare.com' };
+  };
+  remoteTunnel.stop = async () => {
+    stopCalls += 1;
+    return { status: 'offline', url: null };
+  };
+
+  const regularUser = { id: '65b2d8e9f1a23c0012a40001', email: 'user@mediavault.local', role: 'user' };
+  const adminUser = { id: '65b2d8e9f1a23c0012a45bc8', email: 'admin@mediavault.local', role: 'admin' };
+
+  try {
+    for (const method of ['get', 'post', 'delete']) {
+      const denied = await invokeRouteStack(systemRouter, method, '/remote', { user: regularUser });
+      assert.equal(denied.error.statusCode, 403);
+      assert.equal(denied.error.code, 'FORBIDDEN');
+    }
+    assert.equal(getStatusCalls, 0);
+    assert.equal(startCalls, 0);
+    assert.equal(stopCalls, 0);
+
+    const getRes = await invokeRouteStack(systemRouter, 'get', '/remote', { user: adminUser });
+    assert.equal(getRes.error, null);
+    assert.equal(getRes.statusCode, 200);
+    assert.deepEqual(getRes.payload, { tunnel: { status: 'offline', url: null } });
+
+    const postRes = await invokeRouteStack(systemRouter, 'post', '/remote', { user: adminUser });
+    assert.equal(postRes.error, null);
+    assert.equal(postRes.statusCode, 200);
+    assert.deepEqual(postRes.payload, {
+      tunnel: { status: 'online', url: 'https://admin-only.trycloudflare.com' },
+    });
+
+    const delRes = await invokeRouteStack(systemRouter, 'delete', '/remote', { user: adminUser });
+    assert.equal(delRes.error, null);
+    assert.equal(delRes.statusCode, 200);
+    assert.deepEqual(delRes.payload, { tunnel: { status: 'offline', url: null } });
+
+    assert.equal(getStatusCalls, 1);
+    assert.equal(startCalls, 1);
+    assert.equal(stopCalls, 1);
+  } finally {
+    remoteTunnel.getStatus = origGetStatus;
+    remoteTunnel.start = origStart;
+    remoteTunnel.stop = origStop;
   }
 });

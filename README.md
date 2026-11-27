@@ -128,6 +128,12 @@ Use this option with the repository [`docker-compose.yml`](https://github.com/om
 ## Supported Sites & Cookies
 
 - **1,752 extractors across ~1,375 providers:** MediaVault forwards any public `http://` or `https://` URL to the bundled `yt-dlp` build while pinning DNS to validated public IPs (blocking private/loopback/link-local SSRF targets). Inspect the live provider list in **Settings → Supported Sites** or via `GET /api/system/providers`.
+- **List supported sites from the terminal:** Run the following command to display every extractor supported by the bundled `yt-dlp` build:
+
+  ```powershell
+  docker compose exec mediavault yt-dlp --list-extractors
+  ```
+
 - **Any-site cookie upload:** For age-restricted, bot-checked, or login-walled non-DRM videos, export Netscape `cookies.txt` in your browser, go to **Settings → Platform Cookies → Add cookies for any site**, enter the site domain (e.g. `hotstar.com`, `vimeo.com`, or select YouTube/Instagram/X/Facebook), upload `.txt`, and enable **Use saved cookies** on the Downloader page. *(DRM-protected streams cannot be downloaded by `yt-dlp`.)*
 
 ---

@@ -73,6 +73,9 @@ export function AppShell({ children }: AppShellProps) {
     { revalidateOnFocus: true, shouldRetryOnError: false }
   );
 
+  const user = meData?.user ?? null;
+  const isAdmin = user?.role === 'admin';
+
   const {
     data: healthData,
     error: healthError,
@@ -103,7 +106,12 @@ export function AppShell({ children }: AppShellProps) {
   }, [cache, isLoginRoute, meError, mutate, router]);
 
   useEffect(() => {
-    if (isLoginRoute) return;
+    if (isLoginRoute || !isAdmin) {
+      setRemoteTunnel({ status: 'offline', url: null });
+      setRemotePanelOpen(false);
+      setRemoteError(null);
+      return;
+    }
 
     let cancelled = false;
     fetch('/api/system/remote', { cache: 'no-store' })
@@ -125,7 +133,7 @@ export function AppShell({ children }: AppShellProps) {
     return () => {
       cancelled = true;
     };
-  }, [isLoginRoute]);
+  }, [isAdmin, isLoginRoute]);
 
   const fetchedActiveCount = useMemo(() => {
     if (!jobsSummaryData) {
@@ -191,7 +199,7 @@ export function AppShell({ children }: AppShellProps) {
   }
 
   async function changeRemoteTunnel(method: 'POST' | 'DELETE') {
-    if (remoteBusy) return;
+    if (remoteBusy || !isAdmin) return;
     setRemoteBusy(true);
     setRemoteError(null);
     setRemoteCopied(false);
@@ -215,6 +223,7 @@ export function AppShell({ children }: AppShellProps) {
   }
 
   function handleRemoteButtonClick() {
+    if (!isAdmin) return;
     setRemotePanelOpen(true);
     if (remoteTunnel.url || remoteBusy) return;
     void changeRemoteTunnel('POST');
@@ -329,7 +338,6 @@ export function AppShell({ children }: AppShellProps) {
     );
   }
 
-  const user = meData?.user ?? null;
   const activeJobCount = liveActiveCount ?? fetchedActiveCount;
   const nodeStatus: 'checking' | 'online' | 'offline' = healthError
     ? 'offline'
@@ -436,7 +444,7 @@ export function AppShell({ children }: AppShellProps) {
               </span>
             </div>
 
-            {renderRemoteControl()}
+            {isAdmin && renderRemoteControl()}
             <ThemeToggle />
 
             <button
@@ -482,7 +490,7 @@ export function AppShell({ children }: AppShellProps) {
               <span className="font-mono text-[11px] text-ready">Local Node</span>
             </div>
 
-            {renderRemoteControl(true)}
+            {isAdmin && renderRemoteControl(true)}
             <ThemeToggle className="rounded-full" />
 
             <Link

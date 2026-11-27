@@ -6,12 +6,8 @@ const path = require('path');
 const Batch = require('../models/Batch');
 const Job = require('../models/Job');
 const mediaQueue = require('../queues/mediaQueue');
-const {
-  clearJobProgressCache,
-  getJobProgressCache,
-  removeQueuedMediaJob,
-} = mediaQueue;
 const { AppError } = require('../utils/errors');
+const { updateBatchRollup } = require('../utils/batchRollup');
 const { sanitizeFilename } = require('../utils/formatMapper');
 const { assertPublicUrl } = require('../utils/ssrf');
 const { assertSufficientDiskSpace, enforce1080pSelector } = require('../utils/workerHelpers');
@@ -282,6 +278,9 @@ router.post('/', async (req, res, next) => {
           errorMessage: `Failed to enqueue job: ${queueErr.message}`,
         }
       );
+      if (batchId) {
+        await updateBatchRollup(batchId).catch(() => {});
+      }
       throw queueErr;
     }
 
@@ -397,7 +396,7 @@ router.get('/', async (req, res, next) => {
         if (!ACTIVE_STATUSES.has(serialized.status)) {
           return serialized;
         }
-        const cached = await getJobProgressCache(serialized.id).catch(() => null);
+        const cached = await mediaQueue.getJobProgressCache(serialized.id).catch(() => null);
         if (!cached) {
           return serialized;
         }
@@ -464,11 +463,47 @@ router.post('/pause-all', async (req, res, next) => {
       return res.status(200).json({ success: true, pausedCount: 0 });
     }
 
+    const candidateIds = activeJobs.map((j) => j._id);
+    const updateResult = await Job.updateMany(
+      {
+        _id: { $in: candidateIds },
+        userId,
+        status: { $in: ['queued', 'downloading', 'muxing'] },
+      },
+      {
+        status: 'paused',
+        downloadSpeed: null,
+        eta: null,
+        errorMessage: null,
+      }
+    );
+
+    const pausedCount =
+      updateResult?.modifiedCount ?? updateResult?.matchedCount ?? 0;
+    if (pausedCount === 0) {
+      return res.status(200).json({ success: true, pausedCount: 0 });
+    }
+
+    let targetJobs = activeJobs;
+    if (pausedCount < activeJobs.length) {
+      const pausedDocs = await Job.find({
+        _id: { $in: candidateIds },
+        userId,
+        status: 'paused',
+      })
+        .select('_id')
+        .lean();
+      const pausedIdSet = new Set(pausedDocs.map((doc) => doc._id.toString()));
+      targetJobs = activeJobs.filter((item) =>
+        pausedIdSet.has(item._id.toString())
+      );
+    }
+
     const queuedIds = [];
     const runningIds = [];
     const allIds = [];
 
-    for (const item of activeJobs) {
+    for (const item of targetJobs) {
       const idStr = item._id.toString();
       allIds.push(idStr);
       if (item.status === 'queued') {
@@ -482,16 +517,6 @@ router.post('/pause-all', async (req, res, next) => {
       await Promise.all(queuedIds.map((id) => mediaQueue.removeQueuedMediaJob(id)));
     }
 
-    await Job.updateMany(
-      { _id: { $in: activeJobs.map((j) => j._id) }, userId },
-      {
-        status: 'paused',
-        downloadSpeed: null,
-        eta: null,
-        errorMessage: null,
-      }
-    );
-
     await Promise.all(
       allIds.map((id) => mediaQueue.clearJobProgressCache(id).catch(() => {}))
     );
@@ -502,7 +527,7 @@ router.post('/pause-all', async (req, res, next) => {
 
     return res.status(200).json({
       success: true,
-      pausedCount: activeJobs.length,
+      pausedCount: targetJobs.length,
     });
   } catch (err) {
     return next(err);
@@ -526,8 +551,9 @@ router.post('/resume-all', async (req, res, next) => {
       return res.status(200).json({ success: true, resumedCount: 0 });
     }
 
-    await Job.updateMany(
-      { _id: { $in: pausedJobs.map((j) => j._id) }, userId },
+    const candidateIds = pausedJobs.map((j) => j._id);
+    const updateResult = await Job.updateMany(
+      { _id: { $in: candidateIds }, userId, status: 'paused' },
       {
         status: 'queued',
         downloadSpeed: null,
@@ -536,11 +562,45 @@ router.post('/resume-all', async (req, res, next) => {
       }
     );
 
-    await mediaQueue.requeueMediaJobsBulk(pausedJobs);
+    const resumedCount =
+      updateResult?.modifiedCount ?? updateResult?.matchedCount ?? 0;
+    if (resumedCount === 0) {
+      return res.status(200).json({ success: true, resumedCount: 0 });
+    }
+
+    let targetJobs = pausedJobs;
+    if (resumedCount < pausedJobs.length) {
+      targetJobs = await Job.find({
+        _id: { $in: candidateIds },
+        userId,
+        status: 'queued',
+      })
+        .sort({ createdAt: 1, _id: 1 })
+        .lean();
+    }
+
+    try {
+      await mediaQueue.requeueMediaJobsBulk(targetJobs);
+    } catch (queueErr) {
+      const targetIds = targetJobs.map((j) => j._id);
+      const targetIdStrings = targetJobs.map((j) => j._id.toString());
+      await Job.updateMany(
+        { _id: { $in: targetIds }, userId, status: 'queued' },
+        {
+          status: 'paused',
+          downloadSpeed: null,
+          eta: null,
+          errorMessage: null,
+        }
+      ).catch(() => {});
+      await mediaQueue.removeQueuedMediaJobsBulk(targetIdStrings).catch(() => {});
+      await mediaQueue.clearJobProgressCachesBulk(targetIdStrings).catch(() => {});
+      throw queueErr;
+    }
 
     return res.status(200).json({
       success: true,
-      resumedCount: pausedJobs.length,
+      resumedCount: targetJobs.length,
     });
   } catch (err) {
     return next(err);
@@ -576,6 +636,8 @@ router.delete('/', async (req, res, next) => {
     const allIdStrings = [];
     const allIdSet = new Set();
     const activeIds = [];
+    const fenceableObjectIds = [];
+    const filePathsToDelete = new Set();
     const batchIdSet = new Set();
 
     for (const job of userJobs) {
@@ -586,12 +648,47 @@ router.delete('/', async (req, res, next) => {
       if (ACTIVE_STATUSES.has(job.status)) {
         activeIds.push(idStr);
       }
+      if (
+        ACTIVE_STATUSES.has(job.status) ||
+        job.status === 'paused' ||
+        !job.filePath
+      ) {
+        fenceableObjectIds.push(job._id);
+      }
+      if (job.filePath && typeof job.filePath === 'string') {
+        filePathsToDelete.add(job.filePath);
+      }
       if (typeof job.batchId === 'string' && job.batchId.trim()) {
         batchIdSet.add(job.batchId.trim());
       }
     }
 
     await mediaQueue.removeQueuedMediaJobsBulk(allIdStrings);
+
+    if (deleteFiles && fenceableObjectIds.length > 0) {
+      await Job.updateMany(
+        {
+          _id: { $in: fenceableObjectIds },
+          userId,
+          status: { $in: ['queued', 'downloading', 'muxing', 'paused', 'failed'] },
+        },
+        { status: 'cancelled' }
+      );
+
+      const lateCompletedJobs = await Job.find({
+        _id: { $in: fenceableObjectIds },
+        userId,
+        filePath: { $ne: null },
+      })
+        .select('_id filePath')
+        .lean();
+
+      for (const lateJob of lateCompletedJobs) {
+        if (lateJob.filePath && typeof lateJob.filePath === 'string') {
+          filePathsToDelete.add(lateJob.filePath);
+        }
+      }
+    }
 
     const deleteResult = await Job.deleteMany({
       _id: { $in: allObjectIds },
@@ -632,11 +729,11 @@ router.delete('/', async (req, res, next) => {
     let deletedFilesCount = 0;
     if (deleteFiles) {
       const candidateDirs = new Set();
-      for (const job of userJobs) {
-        if (!job.filePath || typeof job.filePath !== 'string') {
+      for (const rawFilePath of filePathsToDelete) {
+        if (!rawFilePath || typeof rawFilePath !== 'string') {
           continue;
         }
-        const resolvedPath = path.resolve(job.filePath);
+        const resolvedPath = path.resolve(rawFilePath);
         if (!resolvedPath.startsWith(`${downloadsDir}${path.sep}`)) {
           continue;
         }
@@ -686,7 +783,20 @@ router.delete('/', async (req, res, next) => {
 router.delete('/expired', async (req, res, next) => {
   try {
     const userId = getRequestUserId(req);
+    const expiredJobs = await Job.find({ userId, status: 'expired' })
+      .select('batchId')
+      .lean();
+    const affectedBatchIds = Array.from(
+      new Set(expiredJobs.map((job) => job.batchId).filter(Boolean))
+    );
+
     const result = await Job.deleteMany({ userId, status: 'expired' });
+    if (affectedBatchIds.length > 0) {
+      await Promise.all(
+        affectedBatchIds.map((batchId) => updateBatchRollup(batchId))
+      );
+    }
+
     return res.status(200).json({
       success: true,
       deletedCount: result?.deletedCount || 0,
@@ -726,12 +836,8 @@ router.post('/:id/pause', async (req, res, next) => {
     }
 
     const previousStatus = job.status;
-    if (previousStatus === 'queued') {
-      await mediaQueue.removeQueuedMediaJob(id);
-    }
-
-    await Job.updateOne(
-      { _id: job._id, userId },
+    const updateResult = await Job.updateOne(
+      { _id: job._id, userId, status: previousStatus },
       {
         status: 'paused',
         downloadSpeed: null,
@@ -739,6 +845,17 @@ router.post('/:id/pause', async (req, res, next) => {
         errorMessage: null,
       }
     );
+    if ((updateResult?.matchedCount ?? updateResult?.modifiedCount ?? 0) === 0) {
+      throw new AppError(
+        409,
+        'INVALID_JOB_STATE',
+        'Job state changed concurrently; cannot pause.'
+      );
+    }
+
+    if (previousStatus === 'queued') {
+      await mediaQueue.removeQueuedMediaJob(id);
+    }
     await mediaQueue.clearJobProgressCache(id).catch(() => {});
 
     if (previousStatus === 'downloading' || previousStatus === 'muxing') {
@@ -785,8 +902,8 @@ router.post('/:id/resume', async (req, res, next) => {
       await resolveCookieFile(job.platform);
     }
 
-    await Job.updateOne(
-      { _id: job._id, userId },
+    const updateResult = await Job.updateOne(
+      { _id: job._id, userId, status: 'paused' },
       {
         status: 'queued',
         downloadSpeed: null,
@@ -794,8 +911,29 @@ router.post('/:id/resume', async (req, res, next) => {
         errorMessage: null,
       }
     );
+    if ((updateResult?.matchedCount ?? updateResult?.modifiedCount ?? 0) === 0) {
+      throw new AppError(
+        409,
+        'INVALID_JOB_STATE',
+        'Job state changed concurrently; cannot resume.'
+      );
+    }
 
-    await mediaQueue.requeueMediaJob(job);
+    try {
+      await mediaQueue.requeueMediaJob(job);
+    } catch (queueErr) {
+      await Job.updateOne(
+        { _id: job._id, userId, status: 'queued' },
+        {
+          status: 'paused',
+          downloadSpeed: null,
+          eta: null,
+          errorMessage: null,
+        }
+      ).catch(() => {});
+      await mediaQueue.clearJobProgressCache(id).catch(() => {});
+      throw queueErr;
+    }
 
     return res.status(202).json({
       success: true,
@@ -841,17 +979,10 @@ router.post('/:id/retry', async (req, res, next) => {
     }
 
     const previousStatus = job.status;
-    let delayMs = 0;
-
-    if (previousStatus === 'downloading' || previousStatus === 'muxing') {
-      await mediaQueue.publishJobControl({ action: 'cancel-for-retry', jobId: id });
-      delayMs = 600;
-    } else if (previousStatus === 'queued') {
-      await mediaQueue.removeQueuedMediaJob(id);
-    }
-
-    await Job.updateOne(
-      { _id: job._id, userId },
+    const previousUseCookies = Boolean(job.useCookies);
+    const previousErrorMessage = job.errorMessage || null;
+    const updateResult = await Job.updateOne(
+      { _id: job._id, userId, status: previousStatus },
       {
         status: 'queued',
         useCookies: nextUseCookies,
@@ -860,9 +991,56 @@ router.post('/:id/retry', async (req, res, next) => {
         errorMessage: null,
       }
     );
-    await mediaQueue.clearJobProgressCache(id).catch(() => {});
+    if ((updateResult?.matchedCount ?? updateResult?.modifiedCount ?? 0) === 0) {
+      throw new AppError(
+        409,
+        'INVALID_JOB_STATE',
+        'Job state changed concurrently; cannot retry.'
+      );
+    }
 
-    await mediaQueue.requeueMediaJob(job, { delayMs });
+    let delayMs = 0;
+
+    try {
+      if (previousStatus === 'downloading' || previousStatus === 'muxing') {
+        await mediaQueue.publishJobControl({ action: 'cancel-for-retry', jobId: id });
+        delayMs = 600;
+      } else if (previousStatus === 'queued') {
+        await mediaQueue.removeQueuedMediaJob(id);
+      }
+
+      await mediaQueue.clearJobProgressCache(id).catch(() => {});
+      await mediaQueue.requeueMediaJob(job, { delayMs });
+    } catch (queueErr) {
+      const rollbackStatus =
+        previousStatus === 'paused' ? 'paused' : 'failed';
+      const rollbackErrorMessage =
+        previousStatus === 'paused'
+          ? null
+          : previousStatus === 'failed'
+            ? previousErrorMessage || `Failed to requeue job: ${queueErr.message}`
+            : `Failed to requeue job: ${queueErr.message}`;
+
+      await Job.updateOne(
+        { _id: job._id, userId, status: 'queued' },
+        {
+          status: rollbackStatus,
+          useCookies: previousUseCookies,
+          downloadSpeed: null,
+          eta: null,
+          errorMessage: rollbackErrorMessage,
+        }
+      ).catch(() => {});
+      await mediaQueue.clearJobProgressCache(id).catch(() => {});
+      if (job.batchId) {
+        await updateBatchRollup(job.batchId).catch(() => {});
+      }
+      throw queueErr;
+    }
+
+    if (job.batchId) {
+      await updateBatchRollup(job.batchId);
+    }
 
     return res.status(202).json({
       success: true,
@@ -942,7 +1120,10 @@ router.delete('/:id', async (req, res, next) => {
     }
 
     await Job.deleteOne({ _id: job._id });
-    await clearJobProgressCache(id).catch(() => {});
+    await mediaQueue.clearJobProgressCache(id).catch(() => {});
+    if (job.batchId) {
+      await updateBatchRollup(job.batchId);
+    }
 
     return res.status(200).json({
       success: true,
@@ -1008,7 +1189,7 @@ router.get('/:id', async (req, res, next) => {
     let totalSizeBytes = job.totalSizeBytes || job.fileSizeBytes || 0;
 
     if (ACTIVE_STATUSES.has(status)) {
-      const cached = await getJobProgressCache(id).catch(() => null);
+      const cached = await mediaQueue.getJobProgressCache(id).catch(() => null);
       if (cached) {
         if (cached.status && VALID_STATUSES.has(cached.status)) {
           status = cached.status;
@@ -1085,6 +1266,9 @@ router.get('/:id/file', async (req, res, next) => {
       await fs.promises.access(resolvedPath, fs.constants.R_OK);
     } catch {
       await Job.findByIdAndUpdate(job._id, { status: 'expired', filePath: null });
+      if (job.batchId) {
+        await updateBatchRollup(job.batchId).catch(() => {});
+      }
       throw new AppError(404, 'JOB_NOT_FOUND', 'Requested download file no longer exists.');
     }
 

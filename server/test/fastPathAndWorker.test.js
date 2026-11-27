@@ -655,3 +655,72 @@ test('parseHumanSizeToBytes parses yt-dlp total sizes and sanitizes unknown toke
     eta: '00:10',
   });
 });
+
+test('moveToUniquePath atomically reserves destinations under concurrent writes and EXDEV fallback', async () => {
+  const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'mv-move-race-'));
+
+  try {
+    // 1. Concurrent moves via hardlink reservation never overwrite each other
+    const linkDestDir = path.join(tempRoot, 'link-dest');
+    const srcPaths = await Promise.all(
+      Array.from({ length: 12 }, async (_, idx) => {
+        const src = path.join(tempRoot, `src_${idx}.mp4`);
+        await fs.promises.writeFile(src, `payload-${idx}`);
+        return src;
+      })
+    );
+
+    const moved = await Promise.all(
+      srcPaths.map((src) => moveToUniquePath(src, linkDestDir, 'Shared_Title.mp4'))
+    );
+
+    const destSet = new Set(moved.map((m) => m.filePath));
+    assert.equal(destSet.size, 12);
+
+    const contents = await Promise.all(
+      moved.map((m) => fs.promises.readFile(m.filePath, 'utf8'))
+    );
+    assert.equal(new Set(contents).size, 12);
+    for (let idx = 0; idx < 12; idx += 1) {
+      assert.ok(contents.includes(`payload-${idx}`));
+      assert.equal(fs.existsSync(srcPaths[idx]), false);
+    }
+
+    // 2. Cross-device fallback (COPYFILE_EXCL) reserves unique destinations under concurrency
+    const exdevDestDir = path.join(tempRoot, 'exdev-dest');
+    const exdevSrcs = await Promise.all(
+      Array.from({ length: 6 }, async (_, idx) => {
+        const src = path.join(tempRoot, `exdev_${idx}.mp4`);
+        await fs.promises.writeFile(src, `exdev-payload-${idx}`);
+        return src;
+      })
+    );
+
+    const origLink = fs.promises.link;
+    fs.promises.link = async () => {
+      const err = new Error('Cross-device link not permitted');
+      err.code = 'EXDEV';
+      throw err;
+    };
+
+    try {
+      const exdevMoved = await Promise.all(
+        exdevSrcs.map((src) => moveToUniquePath(src, exdevDestDir, 'Cross_Device.mp4'))
+      );
+
+      assert.equal(new Set(exdevMoved.map((m) => m.filePath)).size, 6);
+      const exdevContents = await Promise.all(
+        exdevMoved.map((m) => fs.promises.readFile(m.filePath, 'utf8'))
+      );
+      assert.equal(new Set(exdevContents).size, 6);
+      for (let idx = 0; idx < 6; idx += 1) {
+        assert.ok(exdevContents.includes(`exdev-payload-${idx}`));
+        assert.equal(fs.existsSync(exdevSrcs[idx]), false);
+      }
+    } finally {
+      fs.promises.link = origLink;
+    }
+  } finally {
+    await fs.promises.rm(tempRoot, { recursive: true, force: true });
+  }
+});
